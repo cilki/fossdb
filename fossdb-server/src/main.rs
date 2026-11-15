@@ -179,10 +179,9 @@ async fn start_server(config: Config) -> Result<()> {
         ))
         .with_state(state.clone());
 
-    let worker_listener = tokio::net::TcpListener::bind(
-        format!("0.0.0.0:{}", config.worker_port)
-    ).await?;
-    info!("Worker API running on http://0.0.0.0:{}", config.worker_port);
+    let worker_bind = format!("{}:{}", config.internal_bind_address, config.worker_port);
+    let worker_listener = tokio::net::TcpListener::bind(&worker_bind).await?;
+    info!("Worker API running on http://{}", worker_bind);
     tokio::spawn(async move {
         if let Err(e) = axum::serve(worker_listener, worker_api).await {
             error!("Worker API server error: {}", e);
@@ -200,10 +199,9 @@ async fn start_server(config: Config) -> Result<()> {
         ))
         .with_state(state.clone());
 
-    let collector_listener = tokio::net::TcpListener::bind(
-        format!("0.0.0.0:{}", config.collector_port)
-    ).await?;
-    info!("Collector API running on http://0.0.0.0:{}", config.collector_port);
+    let collector_bind = format!("{}:{}", config.internal_bind_address, config.collector_port);
+    let collector_listener = tokio::net::TcpListener::bind(&collector_bind).await?;
+    info!("Collector API running on http://{}", collector_bind);
     tokio::spawn(async move {
         if let Err(e) = axum::serve(collector_listener, collector_api).await {
             error!("Collector API server error: {}", e);
@@ -261,7 +259,7 @@ async fn start_server(config: Config) -> Result<()> {
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let bind = format!("0.0.0.0:{}", config.server_port);
+    let bind = format!("{}:{}", config.bind_address, config.server_port);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     info!("Server running on http://{}", bind);
     info!("Public base URL for feed links: {}", config.public_base_url);

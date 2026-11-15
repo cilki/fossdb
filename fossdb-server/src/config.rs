@@ -13,8 +13,16 @@ pub struct Config {
     pub libraries_io_api_key: Option<String>,
     pub collector_interval_hours: u64,
     pub timeline_retention_days: u64,
+    /// Address the public API binds to.
+    pub bind_address: String,
     pub collector_port: u16,
     pub worker_port: u16,
+    /// Address the collector and worker APIs bind to.
+    ///
+    /// Separate from [`Config::bind_address`] and defaulting to loopback:
+    /// those APIs are guarded only by an API key, so exposing them to the
+    /// network should be a deliberate act rather than the default.
+    pub internal_bind_address: String,
     /// Absolute origin used to build feed links. Feed readers need absolute
     /// URLs, and the server cannot reliably infer its own public origin from
     /// a request when it sits behind a proxy.
@@ -37,8 +45,11 @@ impl Config {
             libraries_io_api_key: env::var("LIBRARIES_IO_API_KEY").ok(),
             collector_interval_hours: parse_or("COLLECTOR_INTERVAL_HOURS", 1),
             timeline_retention_days: parse_or("TIMELINE_RETENTION_DAYS", 90),
+            bind_address: env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0".to_string()),
             collector_port: parse_or("COLLECTOR_PORT", 3001),
             worker_port: parse_or("WORKER_PORT", 3002),
+            internal_bind_address: env::var("INTERNAL_BIND_ADDRESS")
+                .unwrap_or_else(|_| "127.0.0.1".to_string()),
             public_base_url: env::var("PUBLIC_BASE_URL")
                 .unwrap_or_else(|_| "http://localhost:3000".to_string())
                 .trim_end_matches('/')
