@@ -1,4 +1,3 @@
-use crate::components::Navigation;
 use dioxus::prelude::*;
 
 #[component]
@@ -15,8 +14,9 @@ pub fn ApiDocs() -> Element {
         .unwrap_or_else(|| "/api".to_string());
 
     rsx! {
-        Navigation {}
-
+        // No `Navigation` here: the `Layout` wrapper already renders one for
+        // every route. Rendering a second produced two navbars, two independent
+        // login/register modal states, and a second scroll subscription.
         main { class: "min-h-screen bg-gray-900 py-12",
             div { class: "container mx-auto px-6",
                 div { class: "text-center mb-12",

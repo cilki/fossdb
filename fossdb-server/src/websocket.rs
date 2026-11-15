@@ -77,8 +77,26 @@ async fn handle_socket(socket: WebSocket, broadcaster: Arc<TimelineBroadcaster>)
     let mut send_task = tokio::spawn(async move {
         loop {
             tokio::select! {
-                // Receive timeline events from the broadcaster
-                Ok(db_event) = rx.recv() => {
+                // Receive timeline events from the broadcaster.
+                //
+                // The whole `Result` is matched rather than using an
+                // `Ok(..) = ..` pattern: an unmatched pattern disables this
+                // branch for the rest of the `select!`, so a single `Lagged`
+                // error would stall all event delivery until the 30s keepalive
+                // timer fired.
+                received = rx.recv() => {
+                    let db_event = match received {
+                        Ok(db_event) => db_event,
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                            tracing::warn!(
+                                "WebSocket client lagged behind; dropped {} timeline event(s)",
+                                skipped
+                            );
+                            continue;
+                        }
+                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                    };
+
                     // Filter events based on authentication:
                     // - If not authenticated: only send global events (user_id = None)
                     // - If authenticated: only send events for this user

@@ -1,23 +1,36 @@
-use crate::api::{types::SubscriptionResponse, ApiClient};
-use crate::hooks::use_auth;
+use crate::api::{types::PackageSubscription, ApiClient};
+use crate::hooks::{use_auth, use_notifications};
 use dioxus::prelude::*;
 
 #[component]
 pub fn Subscriptions() -> Element {
     let auth = use_auth();
-    let mut subscriptions = use_signal(|| Vec::<SubscriptionResponse>::new());
+    let notif = use_notifications();
+    let mut subscriptions = use_signal(Vec::<PackageSubscription>::new);
     let mut loading = use_signal(|| true);
 
-    // Load subscriptions
-    let token = auth.token();
+    // Load subscriptions.
+    //
+    // `auth.token()` is read *inside* the effect so the effect is subscribed to
+    // it and re-runs on login/logout. Capturing a cloned `Option<String>`
+    // outside meant the effect ran exactly once per mount, leaving the page
+    // stuck on the empty state after logging in.
     use_effect(move || {
-        let token_clone = token.clone();
+        let token = auth.token();
+        let mut notif = notif;
         spawn(async move {
-            if let Some(t) = token_clone {
-                let client = ApiClient::new().with_token(Some(t));
-                if let Ok(subs) = client.get_subscriptions().await {
-                    subscriptions.set(subs);
+            match token {
+                Some(t) => {
+                    let client = ApiClient::new().with_token(Some(t));
+                    match client.get_subscriptions().await {
+                        Ok(subs) => subscriptions.set(subs),
+                        Err(e) => {
+                            notif.error(format!("Failed to load subscriptions: {:?}", e));
+                            subscriptions.set(Vec::new());
+                        }
+                    }
                 }
+                None => subscriptions.set(Vec::new()),
             }
             loading.set(false);
         });
@@ -72,18 +85,10 @@ pub fn Subscriptions() -> Element {
                                                     h3 { class: "text-xl font-bold text-gray-100 mb-2",
                                                         "{pkg_name}"
                                                     }
-                                                    if let Some(package) = &sub.package {
-                                                        if let Some(description) = &package.description {
-                                                            p { class: "text-gray-400 text-sm mb-4", "{description}" }
-                                                        }
-                                                        if let Some(repository) = &package.repository {
-                                                            a {
-                                                                href: "{repository}",
-                                                                target: "_blank",
-                                                                class: "text-blue-400 hover:text-blue-300 text-sm",
-                                                                "View Repository"
-                                                            }
-                                                        }
+                                                    Link {
+                                                        to: crate::Route::Packages {},
+                                                        class: "text-blue-400 hover:text-blue-300 text-sm",
+                                                        "Browse packages"
                                                     }
                                                 }
                                                 div { class: "flex items-center space-x-4",
@@ -96,10 +101,18 @@ pub fn Subscriptions() -> Element {
                                                                 let pkg = pkg_name_toggle.clone();
                                                                 let token = token_toggle.clone();
                                                                 let enabled = evt.checked();
+                                                                let mut notif = notif;
                                                                 spawn(async move {
                                                                     if let Some(t) = token {
                                                                         let client = ApiClient::new().with_token(Some(t));
-                                                                        let _ = client.toggle_notifications(&pkg, enabled).await;
+                                                                        match client.toggle_notifications(&pkg, enabled).await {
+                                                                            // Adopt the server's view so the checkbox
+                                                                            // cannot drift from stored state.
+                                                                            Ok(updated) => subscriptions.set(updated),
+                                                                            Err(e) => notif.error(
+                                                                                format!("Failed to update notifications: {:?}", e),
+                                                                            ),
+                                                                        }
                                                                     }
                                                                 });
                                                             }
@@ -111,11 +124,15 @@ pub fn Subscriptions() -> Element {
                                                         onclick: move |_| {
                                                             let pkg = pkg_name_unsub.clone();
                                                             let token = token_unsub.clone();
+                                                            let mut notif = notif;
                                                             spawn(async move {
                                                                 if let Some(t) = token {
                                                                     let client = ApiClient::new().with_token(Some(t));
-                                                                    if client.unsubscribe(&pkg).await.is_ok() {
-                                                                        subscriptions.write().retain(|s| s.package_name != pkg);
+                                                                    match client.unsubscribe(&pkg).await {
+                                                                        Ok(updated) => subscriptions.set(updated),
+                                                                        Err(e) => notif.error(
+                                                                            format!("Failed to unsubscribe: {:?}", e),
+                                                                        ),
                                                                     }
                                                                 }
                                                             });

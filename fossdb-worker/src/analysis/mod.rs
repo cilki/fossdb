@@ -31,58 +31,86 @@ pub async fn analyze(task: &WorkerTask, http: &reqwest::Client) -> Result<Worker
 
     let mut findings = Vec::new();
 
-    // Verify checksum if available
-    let checksum_verified = if let Some(expected) = &task.version.checksum {
-        let expected_norm = expected.trim().to_lowercase();
-        let actual_norm = actual_checksum.to_lowercase();
-        let matches = actual_norm == expected_norm
-            || actual_norm == expected_norm.trim_start_matches("sha256:");
-        if !matches {
-            findings.push(AnalysisFinding {
-                kind: FindingKind::ChecksumMismatch,
-                severity: FindingSeverity::High,
-                description: format!("Expected checksum {}, got {}", expected, actual_checksum),
-                location: Some(download_url.to_string()),
-            });
+    // Verify checksum if available.
+    //
+    // Only hex SHA-256 can be compared against what `download` computes. Any
+    // other digest (MD5, SHA-512, `sha512-<base64>` SRI, nix base32) would
+    // never be equal, and reporting that as a High-severity mismatch would be
+    // a false accusation of tampering - so it is surfaced as "unsupported"
+    // with `checksum_verified = None` instead.
+    let checksum_verified = match task.version.checksum.as_deref() {
+        Some(expected) => {
+            let expected_norm = expected
+                .trim()
+                .trim_start_matches("sha256:")
+                .trim_start_matches("sha256-")
+                .to_lowercase();
+
+            if is_hex_sha256(&expected_norm) {
+                let matches = actual_checksum.to_lowercase() == expected_norm;
+                if !matches {
+                    findings.push(AnalysisFinding {
+                        kind: FindingKind::ChecksumMismatch,
+                        severity: FindingSeverity::High,
+                        description: format!(
+                            "Expected checksum {}, got {}",
+                            expected, actual_checksum
+                        ),
+                        location: Some(download_url.to_string()),
+                    });
+                }
+                Some(matches)
+            } else {
+                tracing::warn!(
+                    "Unsupported checksum format for {}@{}: {:?}",
+                    task.package.name,
+                    task.version.version,
+                    expected
+                );
+                None
+            }
         }
-        Some(matches)
-    } else {
-        None
+        None => None,
     };
 
     // Detect format from the file contents and dispatch to appropriate analyzer
+    let mut detected_licenses: Vec<&'static str> = Vec::new();
     match source::detect_format(tmp.path())? {
         Some(format) => {
             tracing::debug!("Detected source archive format {:?}", format);
             match source::analyze_archive(tmp.path(), format) {
-                Ok(mut source_findings) => findings.append(&mut source_findings),
+                Ok(mut analysis) => {
+                    findings.append(&mut analysis.findings);
+                    detected_licenses = analysis.detected_licenses;
+                }
                 Err(e) => tracing::warn!("Source analysis failed: {}", e),
             }
         }
-        None => match binary::analyze(tmp.path()) {
+        None => match binary::analyze(tmp.path(), &task.package.name) {
             Ok(mut binary_findings) => findings.append(&mut binary_findings),
             Err(e) => tracing::warn!("Binary analysis failed: {}", e),
         },
     }
 
-    // Check if detected license matches declared license
+    // Check the declared license against *every* detected license: a
+    // dual-licensed project legitimately ships several license files, and
+    // matching only the first one produced spurious mismatches.
     if let Some(declared) = &task.package.license {
-        if let Some(detected_finding) = findings
-            .iter()
-            .find(|f| f.kind == FindingKind::LicenseDetected)
-        {
-            let detected = detected_finding
-                .description
-                .trim_start_matches("License file detected: ");
-            if !declared.to_uppercase().contains(&detected.to_uppercase())
-                && !detected.to_uppercase().contains(&declared.to_uppercase())
-            {
+        if !detected_licenses.is_empty() {
+            let declared_upper = declared.to_uppercase();
+            let any_match = detected_licenses.iter().any(|detected| {
+                let detected_upper = detected.to_uppercase();
+                declared_upper.contains(&detected_upper) || detected_upper.contains(&declared_upper)
+            });
+
+            if !any_match {
                 findings.push(AnalysisFinding {
                     kind: FindingKind::LicenseMismatch,
                     severity: FindingSeverity::Medium,
                     description: format!(
                         "Declared license '{}' does not match detected '{}'",
-                        declared, detected
+                        declared,
+                        detected_licenses.join(" OR ")
                     ),
                     location: None,
                 });
@@ -90,14 +118,11 @@ pub async fn analyze(task: &WorkerTask, http: &reqwest::Client) -> Result<Worker
         }
     }
 
-    let detected_license = findings
-        .iter()
-        .find(|f| f.kind == FindingKind::LicenseDetected)
-        .map(|f| {
-            f.description
-                .trim_start_matches("License file detected: ")
-                .to_string()
-        });
+    let detected_license = if detected_licenses.is_empty() {
+        None
+    } else {
+        Some(detected_licenses.join(" OR "))
+    };
 
     Ok(WorkerAnalysis {
         id: 0,
@@ -108,6 +133,12 @@ pub async fn analyze(task: &WorkerTask, http: &reqwest::Client) -> Result<Worker
         checksum_verified,
         detected_license,
     })
+}
+
+/// True for a bare hex-encoded SHA-256 digest, the only format `download`
+/// produces and therefore the only one that can be meaningfully compared.
+fn is_hex_sha256(value: &str) -> bool {
+    value.len() == 64 && value.bytes().all(|b| b.is_ascii_hexdigit())
 }
 
 async fn download(
@@ -122,7 +153,7 @@ async fn download(
     let mut total = 0u64;
 
     while let Some(chunk) = response.chunk().await? {
-        if total + chunk.len() as u64 > MAX_DOWNLOAD_BYTES {
+        if total.saturating_add(chunk.len() as u64) > MAX_DOWNLOAD_BYTES {
             return Err(anyhow::anyhow!(
                 "Download exceeds {} byte limit",
                 MAX_DOWNLOAD_BYTES

@@ -1,9 +1,18 @@
 use crate::api::types::Package;
 use crate::Route;
+use crate::components::use_comparison;
 use dioxus::prelude::*;
 
 #[component]
 pub fn PackageCard(package: Package) -> Element {
+    // `ComparisonContext::add` had no caller anywhere in the crate, so the
+    // comparison state was always empty and `ComparisonBar` always
+    // early-returned - the entire compare feature was unreachable UI.
+    let comparison = use_comparison();
+    let package_id = package.id;
+    let in_comparison = comparison.contains(package_id);
+    let package_for_compare = package.clone();
+
     rsx! {
         Link {
             to: Route::PackageDetail { id: package.id.to_string() },
@@ -32,23 +41,46 @@ pub fn PackageCard(package: Package) -> Element {
             }
 
             div { class: "flex items-center space-x-4 text-sm text-gray-500",
-                if let Some(homepage) = &package.homepage {
+                if let Some(homepage) = package.homepage.as_deref().and_then(crate::util::safe_external_url) {
                     a {
                         href: "{homepage}",
                         target: "_blank",
+                        rel: "noopener noreferrer",
                         class: "hover:text-blue-400 transition-colors",
                         onclick: |e| e.stop_propagation(),
                         "Homepage"
                     }
                 }
-                if let Some(repository) = &package.repository {
+                if let Some(repository) = package.repository.as_deref().and_then(crate::util::safe_external_url) {
                     a {
                         href: "{repository}",
                         target: "_blank",
+                        rel: "noopener noreferrer",
                         class: "hover:text-blue-400 transition-colors",
                         onclick: |e| e.stop_propagation(),
                         "Repository"
                     }
+                }
+
+                button {
+                    class: if in_comparison {
+                        "ml-auto text-blue-400 transition-colors"
+                    } else {
+                        "ml-auto hover:text-blue-400 transition-colors"
+                    },
+                    onclick: move |e: Event<MouseData>| {
+                        // The card is wrapped in a `Link`; without this the
+                        // click would also navigate to the detail page.
+                        e.stop_propagation();
+                        e.prevent_default();
+                        let mut comparison = comparison;
+                        if comparison.contains(package_id) {
+                            comparison.remove(package_id);
+                        } else {
+                            comparison.add(package_for_compare.clone());
+                        }
+                    },
+                    if in_comparison { "Remove from compare" } else { "Compare" }
                 }
             }
         }

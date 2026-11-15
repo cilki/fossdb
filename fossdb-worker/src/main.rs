@@ -48,13 +48,9 @@ async fn main() -> Result<()> {
 }
 
 async fn run_once(client: &WorkerClient) -> Result<()> {
-    let task = match client.get_task().await {
-        Ok(t) => t,
-        Err(e) if e.to_string().contains("404") => {
-            tracing::info!("No unanalyzed packages available, skipping");
-            return Ok(());
-        }
-        Err(e) => return Err(e),
+    let Some(task) = client.get_task().await? else {
+        tracing::info!("No unanalyzed packages available, skipping");
+        return Ok(());
     };
 
     tracing::info!(

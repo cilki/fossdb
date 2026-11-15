@@ -15,10 +15,14 @@ pub async fn get_task(
     let mut packages = state.db.get_all_packages().map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
     packages.sort_unstable_by(|a, b| b.id.cmp(&a.id));
 
+    let now = std::time::Instant::now();
     let mut claimed = state
         .claimed_versions
         .lock()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    // Reclaim versions abandoned by workers that never reported back.
+    claimed.prune_expired(now);
 
     for pkg in &packages {
         let versions = state
@@ -31,11 +35,6 @@ pub async fn get_task(
             continue;
         };
 
-        // Skip if already claimed by another worker
-        if claimed.contains(&version.id) {
-            continue;
-        }
-
         // Skip if a completed analysis already exists for this version
         let existing = state
             .db
@@ -45,7 +44,11 @@ pub async fn get_task(
             continue;
         }
 
-        claimed.insert(version.id);
+        // Skip if another worker holds a live claim on this version.
+        if !claimed.try_claim(version.id, now) {
+            continue;
+        }
+
         return Ok(Json(WorkerTask {
             package: pkg.inner.clone(),
             version: version.inner,
@@ -57,7 +60,7 @@ pub async fn get_task(
 
 pub async fn submit_analysis(
     State(state): State<AppState>,
-    Json(analysis): Json<FossdbWorkerAnalysis>,
+    Json(mut analysis): Json<FossdbWorkerAnalysis>,
 ) -> Result<Json<FossdbWorkerAnalysis>, StatusCode> {
     // Validate the referenced package and version exist
     state
@@ -66,17 +69,30 @@ pub async fn submit_analysis(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::BAD_REQUEST)?;
 
-    state
+    let version = state
         .db
         .get_version(analysis.version_id)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
         .ok_or(StatusCode::BAD_REQUEST)?;
 
-    // Release the claim so another worker can pick up this version if needed
-    if let Ok(mut claimed) = state.claimed_versions.lock() {
-        claimed.remove(&analysis.version_id);
+    // The version must actually belong to the package it is submitted under,
+    // otherwise an analysis would surface under an unrelated package.
+    if version.package_id != analysis.package_id {
+        tracing::warn!(
+            "Rejecting analysis: version {} belongs to package {}, not {}",
+            analysis.version_id,
+            version.package_id,
+            analysis.package_id
+        );
+        return Err(StatusCode::BAD_REQUEST);
     }
 
+    // The primary key is ours to assign. Honouring a client-supplied id would
+    // let a worker plant a duplicate key (breaking a later insert) or jump the
+    // id generator to u64::MAX.
+    analysis.id = 0;
+
+    let version_id = analysis.version_id;
     let model = WorkerAnalysis { inner: analysis };
     let saved = state
         .db
@@ -85,6 +101,14 @@ pub async fn submit_analysis(
             tracing::error!("Failed to insert worker analysis: {}", e);
             StatusCode::INTERNAL_SERVER_ERROR
         })?;
+
+    // Release the claim only once the analysis is durably committed. Releasing
+    // beforehand opens a window where the version looks neither claimed nor
+    // analyzed, so a second worker would be handed the same task. If the insert
+    // fails the claim is left to expire on its own.
+    if let Ok(mut claimed) = state.claimed_versions.lock() {
+        claimed.release(version_id);
+    }
 
     tracing::info!(
         "Stored analysis for package_id={} version_id={} findings={}",

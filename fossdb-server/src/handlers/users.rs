@@ -6,17 +6,9 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{AppState, auth::Claims, PackageSubscription};
-
-#[derive(Debug, Deserialize)]
-pub struct SubscriptionRequest {
-    pub package_name: String,
-}
-
-#[derive(Debug, Serialize)]
-pub struct SubscriptionResponse {
-    pub subscriptions: Vec<PackageSubscription>,
-}
+// `SubscriptionRequest`/`SubscriptionResponse` come from the shared `fossdb`
+// crate so the client cannot drift out of sync with the wire format.
+use crate::{AppState, PackageSubscription, SubscriptionRequest, SubscriptionResponse, auth::Claims};
 
 #[derive(Debug, Deserialize)]
 pub struct UpdatePackageNotificationRequest {

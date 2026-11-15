@@ -1,47 +1,56 @@
 use crate::api::types::Package;
-use crate::hooks::use_notifications;
+use crate::hooks::{NotificationContext, use_notifications};
 use dioxus::prelude::*;
 use std::collections::VecDeque;
 
-#[derive(Clone, PartialEq)]
+/// Maximum packages that can be compared at once.
+pub const MAX_COMPARISON_PACKAGES: usize = 3;
+
+#[derive(Clone, PartialEq, Default)]
 pub struct ComparisonState {
     pub packages: VecDeque<Package>,
 }
 
-impl Default for ComparisonState {
-    fn default() -> Self {
-        Self {
-            packages: VecDeque::new(),
-        }
-    }
-}
-
+/// Handle to the comparison state.
+///
+/// Holds the notification context captured at hook time. Previously `add`
+/// called `use_notifications()` itself, i.e. a hook invoked from outside render,
+/// which appends to the scope's hook list at an index the render pass does not
+/// know about. Re-using that slot with a different type later triggers dioxus's
+/// "unable to retrieve the hook initialized at this index" panic.
+#[derive(Copy, Clone)]
 pub struct ComparisonContext {
     state: Signal<ComparisonState>,
+    notifications: NotificationContext,
 }
 
 impl ComparisonContext {
     pub fn add(&mut self, package: Package) {
-        let mut state = self.state.write();
-        let mut notif = use_notifications();
+        let mut notif = self.notifications;
 
-        if state.packages.len() >= 3 {
-            notif.warning("Maximum 3 packages can be compared".to_string());
-            return;
+        {
+            let state = self.state.read();
+            if state.packages.len() >= MAX_COMPARISON_PACKAGES {
+                drop(state);
+                notif.warning(format!(
+                    "Maximum {} packages can be compared",
+                    MAX_COMPARISON_PACKAGES
+                ));
+                return;
+            }
+            if state.packages.iter().any(|p| p.id == package.id) {
+                drop(state);
+                notif.info("Package already in comparison".to_string());
+                return;
+            }
         }
 
-        if state.packages.iter().any(|p| p.id == package.id) {
-            notif.info("Package already in comparison".to_string());
-            return;
-        }
-
-        state.packages.push_back(package);
+        self.state.write().packages.push_back(package);
         notif.success("Package added to comparison".to_string());
     }
 
     pub fn remove(&mut self, package_id: u64) {
-        let mut state = self.state.write();
-        state.packages.retain(|p| p.id != package_id);
+        self.state.write().packages.retain(|p| p.id != package_id);
     }
 
     pub fn clear(&mut self) {
@@ -51,11 +60,18 @@ impl ComparisonContext {
     pub fn count(&self) -> usize {
         self.state.read().packages.len()
     }
+
+    pub fn contains(&self, package_id: u64) -> bool {
+        self.state.read().packages.iter().any(|p| p.id == package_id)
+    }
 }
 
 pub fn use_comparison() -> ComparisonContext {
-    let state = use_context::<Signal<ComparisonState>>();
-    ComparisonContext { state }
+    ComparisonContext {
+        state: use_context::<Signal<ComparisonState>>(),
+        // Called during render, which is where hooks belong.
+        notifications: use_notifications(),
+    }
 }
 
 #[component]
@@ -91,7 +107,7 @@ pub fn ComparisonBar() -> Element {
                                 button {
                                     class: "text-red-400 hover:text-red-300",
                                     onclick: move |_| {
-                                        let mut comp = use_comparison();
+                                        let mut comp = comparison;
                                         comp.remove(pkg_id);
                                     },
                                     svg { class: "w-4 h-4", fill: "none", stroke: "currentColor", view_box: "0 0 24 24",
@@ -112,7 +128,7 @@ pub fn ComparisonBar() -> Element {
                 button {
                     class: "px-4 py-2 bg-gray-600 text-white rounded hover:bg-gray-500 transition-colors",
                     onclick: move |_| {
-                        let mut comp = use_comparison();
+                        let mut comp = comparison;
                         comp.clear();
                     },
                     "Clear"
@@ -165,8 +181,8 @@ fn ComparisonModal(show: Signal<bool>, packages: Vec<Package>) -> Element {
                                     td { class: "p-4 text-gray-400", "Homepage" }
                                     for pkg in packages.iter() {
                                         td { class: "p-4",
-                                            if let Some(homepage) = &pkg.homepage {
-                                                a { class: "text-blue-400 hover:underline", href: "{homepage}", target: "_blank", "Visit" }
+                                            if let Some(homepage) = pkg.homepage.as_deref().and_then(crate::util::safe_external_url) {
+                                                a { class: "text-blue-400 hover:underline", href: "{homepage}", target: "_blank", rel: "noopener noreferrer", "Visit" }
                                             } else {
                                                 span { class: "text-gray-500", "N/A" }
                                             }
@@ -177,8 +193,8 @@ fn ComparisonModal(show: Signal<bool>, packages: Vec<Package>) -> Element {
                                     td { class: "p-4 text-gray-400", "Repository" }
                                     for pkg in packages.iter() {
                                         td { class: "p-4",
-                                            if let Some(repo) = &pkg.repository {
-                                                a { class: "text-blue-400 hover:underline", href: "{repo}", target: "_blank", "Visit" }
+                                            if let Some(repo) = pkg.repository.as_deref().and_then(crate::util::safe_external_url) {
+                                                a { class: "text-blue-400 hover:underline", href: "{repo}", target: "_blank", rel: "noopener noreferrer", "Visit" }
                                             } else {
                                                 span { class: "text-gray-500", "N/A" }
                                             }

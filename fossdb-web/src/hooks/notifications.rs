@@ -55,8 +55,14 @@ impl NotificationContext {
             id
         };
 
+        // `spawn_forever`, not `spawn`: `spawn` attaches the task to the
+        // *calling* component's scope, and dioxus cancels a scope's tasks when
+        // it unmounts. A toast raised just before navigating away therefore
+        // never got cleaned up and stayed on screen for the rest of the
+        // session. The notification itself lives in a global context, so its
+        // expiry timer must not be owned by whichever component raised it.
         let mut state_clone = self.state;
-        spawn(async move {
+        dioxus::core::spawn_forever(async move {
             gloo_timers::future::sleep(std::time::Duration::from_secs(3)).await;
             state_clone.write().notifications.retain(|n| n.id != id);
         });

@@ -105,7 +105,9 @@ async fn start_server(config: Config) -> Result<()> {
         broadcaster: broadcaster.clone(),
         collector_api_key: config.collector_api_key.clone(),
         worker_api_key: config.worker_api_key.clone(),
-        claimed_versions: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        claimed_versions: std::sync::Arc::new(std::sync::Mutex::new(
+            fossdb_server::claims::ClaimSet::new(),
+        )),
     };
 
     // Email notifications

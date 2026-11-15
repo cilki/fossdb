@@ -42,17 +42,18 @@ async fn main() -> Result<()> {
     let mut collector_list: Vec<Arc<dyn Collector>> = vec![];
 
     #[cfg(feature = "collector-rust")]
-    {
-        let http = reqwest::Client::builder().user_agent("fossdb-collector").build()?;
-        collector_list.push(Arc::new(collectors::crates_io::CratesIoCollector::new(http)));
-    }
+    collector_list.push(Arc::new(collectors::crates_io::CratesIoCollector::new()));
 
     #[cfg(feature = "collector-nixpkgs")]
     collector_list.push(Arc::new(collectors::nixpkgs::NixpkgsCollector {}));
 
     #[cfg(feature = "collector-libraries-io")]
     if let Some(api_key) = config.libraries_io_api_key {
-        let http = reqwest::Client::builder().user_agent("fossdb-collector").build()?;
+        let http = reqwest::Client::builder()
+            .user_agent("fossdb-collector")
+            .timeout(std::time::Duration::from_secs(30))
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .build()?;
         collector_list.push(Arc::new(collectors::libraries_io::LibrariesIoCollector::new(http, api_key)));
     }
 
@@ -66,13 +67,32 @@ async fn main() -> Result<()> {
         .map(|collector| {
             let client = client.clone();
             let interval_hours = config.interval_hours;
+            let name = collector.name().to_string();
             tokio::spawn(async move {
                 run_collector_loop(collector, client, interval_hours).await;
+                name
             })
         })
         .collect();
 
-    futures::future::join_all(handles).await;
+    // Surface panics instead of discarding the `JoinError`. Previously a
+    // panicking collector vanished silently, and if every collector panicked
+    // the process exited with status 0 as though all was well.
+    let mut lost = 0usize;
+    for result in futures::future::join_all(handles).await {
+        match result {
+            Ok(name) => tracing::error!("Collector {} loop exited unexpectedly", name),
+            Err(e) => {
+                lost += 1;
+                tracing::error!("Collector task terminated abnormally: {}", e);
+            }
+        }
+    }
+
+    if lost > 0 {
+        anyhow::bail!("{} collector task(s) terminated abnormally", lost);
+    }
+
     Ok(())
 }
 
@@ -88,7 +108,9 @@ async fn run_collector_loop(
             Ok(()) => tracing::info!("Collector {} completed", name),
             Err(e) => tracing::error!("Collector {} failed: {}", name, e),
         }
-        let duration = tokio::time::Duration::from_secs(interval_hours * 3600);
+        // `saturating_mul` so a large COLLECTOR_INTERVAL_HOURS cannot overflow
+        // (a panic with overflow checks on, or a near-zero sleep without them).
+        let duration = tokio::time::Duration::from_secs(interval_hours.saturating_mul(3600));
         tracing::info!("Collector {} sleeping for {} hours", name, interval_hours);
         tokio::time::sleep(duration).await;
     }

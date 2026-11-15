@@ -2,18 +2,21 @@ use anyhow::Result;
 use fossdb::{AnalysisFinding, FindingKind, FindingSeverity};
 use std::path::Path;
 
-pub fn analyze(path: &Path) -> Result<Vec<AnalysisFinding>> {
+/// Analyze a downloaded binary.
+///
+/// `name` is used as the reported `location` for findings. It must be a
+/// meaningful identifier (the package name), not `path`: `path` points at a
+/// randomly named temp file, which is useless to any consumer of the findings
+/// and needlessly discloses the worker's local filesystem layout.
+pub fn analyze(path: &Path, name: &str) -> Result<Vec<AnalysisFinding>> {
     let bytes = std::fs::read(path)?;
-    let mut findings = analyze_bytes(&bytes, path.to_string_lossy().as_ref())?;
+    let mut findings = analyze_bytes(&bytes, name)?;
 
     #[cfg(feature = "analysis-symbolic")]
     {
         match super::symbolic::extract_syscalls_program(path) {
             Ok(syscalls) => {
-                findings.append(&mut super::symbolic::syscalls_to_findings(
-                    &syscalls,
-                    path.to_string_lossy().as_ref(),
-                ));
+                findings.append(&mut super::symbolic::syscalls_to_findings(&syscalls, name));
             }
             Err(e) => tracing::debug!("whole-program symbolic analysis skipped: {}", e),
         }
@@ -80,8 +83,22 @@ fn analyze_elf(elf: &goblin::elf::Elf, bytes: &[u8], name: &str) -> Result<Vec<A
     // Check for packed/obfuscated sections: very high entropy sections
     for section in &elf.section_headers {
         if section.sh_size > 0 && section.sh_type == goblin::elf::section_header::SHT_PROGBITS {
+            // `sh_offset`/`sh_size` are unvalidated u64s straight out of the
+            // file, so a bogus header can overflow this addition. Overflow
+            // checks are on in dev profiles, which turned a malformed ELF into
+            // a process-killing panic.
             let start = section.sh_offset as usize;
-            let end = (start + section.sh_size as usize).min(bytes.len());
+            let Some(end) = start
+                .checked_add(section.sh_size as usize)
+                .map(|e| e.min(bytes.len()))
+            else {
+                tracing::debug!(
+                    "skipping section with out-of-range offset {} size {}",
+                    section.sh_offset,
+                    section.sh_size
+                );
+                continue;
+            };
             if end > start {
                 let entropy = byte_entropy(&bytes[start..end]);
                 if entropy > 7.5 {

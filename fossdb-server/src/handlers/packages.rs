@@ -16,6 +16,25 @@ pub struct ListPackagesQuery {
     limit: Option<u32>,
     search: Option<String>,
     tag: Option<String>,
+    /// Filter by package language (case-insensitive exact match).
+    language: Option<String>,
+    /// Filter by declared license (case-insensitive exact match).
+    license: Option<String>,
+    /// Only packages updated within this window: `today`, `week`, `month`,
+    /// `year`.
+    updated_within: Option<String>,
+}
+
+/// Translate an `updated_within` keyword into a cutoff timestamp.
+fn updated_within_cutoff(value: &str) -> Option<chrono::DateTime<Utc>> {
+    let days = match value {
+        "today" => 1,
+        "week" => 7,
+        "month" => 30,
+        "year" => 365,
+        _ => return None,
+    };
+    Some(Utc::now() - chrono::Duration::days(days))
 }
 
 pub async fn list_packages(
@@ -42,11 +61,45 @@ pub async fn list_packages(
                 packages.retain(|pkg| pkg.tags.iter().any(|t| t.eq_ignore_ascii_case(tag)));
             }
 
-            // Apply pagination
+            // Language / license / recency filters.
+            //
+            // These are applied here, before pagination, so `total` reflects the
+            // filtered count. The client used to filter the already-paginated
+            // page itself, which produced mostly-empty pages while the pager
+            // still advertised the unfiltered page count.
+            if let Some(language) = params.language.as_deref().filter(|l| !l.is_empty()) {
+                packages.retain(|pkg| {
+                    pkg.language
+                        .as_deref()
+                        .is_some_and(|l| l.eq_ignore_ascii_case(language))
+                });
+            }
+
+            if let Some(license) = params.license.as_deref().filter(|l| !l.is_empty()) {
+                packages.retain(|pkg| {
+                    pkg.license
+                        .as_deref()
+                        .is_some_and(|l| l.eq_ignore_ascii_case(license))
+                });
+            }
+
+            if let Some(cutoff) = params
+                .updated_within
+                .as_deref()
+                .and_then(updated_within_cutoff)
+            {
+                packages.retain(|pkg| pkg.updated_at >= cutoff);
+            }
+
+            // Apply pagination.
+            //
+            // `page` is clamped and the arithmetic done in `usize`: the previous
+            // `((page - 1) * limit as u32)` overflowed in u32 for a large `page`,
+            // which panics with overflow checks enabled.
             let total = packages.len();
             let limit = params.limit.unwrap_or(50).min(100) as usize;
-            let page = params.page.unwrap_or(1).max(1);
-            let offset = ((page - 1) * limit as u32) as usize;
+            let page = params.page.unwrap_or(1).max(1) as usize;
+            let offset = page.saturating_sub(1).saturating_mul(limit);
 
             let paginated_packages: Vec<Package> =
                 packages.into_iter().skip(offset).take(limit).collect();

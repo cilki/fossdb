@@ -124,12 +124,14 @@ impl Database {
 
         drop(r);
 
-        let package_ids = Arc::new(IdGenerator::new(max_package_id + 1));
-        let version_ids = Arc::new(IdGenerator::new(max_version_id + 1));
-        let user_ids = Arc::new(IdGenerator::new(max_user_id + 1));
-        let vulnerability_ids = Arc::new(IdGenerator::new(max_vulnerability_id + 1));
-        let timeline_ids = Arc::new(IdGenerator::new(max_timeline_id + 1));
-        let analysis_ids = Arc::new(IdGenerator::new(max_analysis_id + 1));
+        // `saturating_add` so a corrupt/hostile max id cannot overflow here;
+        // `IdGenerator::next` then fails loudly rather than wrapping to 0.
+        let package_ids = Arc::new(IdGenerator::new(max_package_id.saturating_add(1)));
+        let version_ids = Arc::new(IdGenerator::new(max_version_id.saturating_add(1)));
+        let user_ids = Arc::new(IdGenerator::new(max_user_id.saturating_add(1)));
+        let vulnerability_ids = Arc::new(IdGenerator::new(max_vulnerability_id.saturating_add(1)));
+        let timeline_ids = Arc::new(IdGenerator::new(max_timeline_id.saturating_add(1)));
+        let analysis_ids = Arc::new(IdGenerator::new(max_analysis_id.saturating_add(1)));
 
         Ok(Self {
             db,
@@ -145,14 +147,12 @@ impl Database {
     impl_insert!(insert_package, Package, package_ids);
     impl_get!(get_package, Package);
 
+    /// Exact lookup by name. `name` is a `unique` secondary key, so this must
+    /// use `get().secondary()` rather than a `start_with` prefix scan, which
+    /// would match any package whose name merely begins with `name`.
     pub fn get_package_by_name(&self, name: &str) -> Result<Option<Package>> {
         let r = self.db.r_transaction()?;
-        let results: Vec<Package> = r
-            .scan()
-            .secondary(PackageKey::name)?
-            .start_with(name)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(results.into_iter().next())
+        Ok(r.get().secondary(PackageKey::name, name)?)
     }
 
     impl_get_all!(get_all_packages, Package);
@@ -180,25 +180,18 @@ impl Database {
     impl_insert!(insert_user, User, user_ids);
     impl_get!(get_user, User);
 
+    /// Exact lookup by email (a `unique` secondary key); see
+    /// [`Database::get_package_by_name`] for why this is not a prefix scan.
     pub fn get_user_by_email(&self, email: &str) -> Result<Option<User>> {
         let r = self.db.r_transaction()?;
-        let results: Vec<User> = r
-            .scan()
-            .secondary(UserKey::email)?
-            .start_with(email)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(results.into_iter().next())
+        Ok(r.get().secondary(UserKey::email, email)?)
     }
 
+    /// Exact lookup by username (a `unique` secondary key).
     #[allow(dead_code)]
     pub fn get_user_by_username(&self, username: &str) -> Result<Option<User>> {
         let r = self.db.r_transaction()?;
-        let results: Vec<User> = r
-            .scan()
-            .secondary(UserKey::username)?
-            .start_with(username)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(results.into_iter().next())
+        Ok(r.get().secondary(UserKey::username, username)?)
     }
 
     impl_get_all!(get_all_users, User);

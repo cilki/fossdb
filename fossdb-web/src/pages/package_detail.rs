@@ -16,44 +16,64 @@ pub fn PackageDetail(id: String) -> Element {
     let mut current_page = use_signal(|| 0);
 
     let token = auth.token();
-    let package_id = id.clone();
-    let is_authenticated = auth.is_authenticated();
 
-    // Load package data
-    let token_for_effect = token.clone();
-    let package_id_for_effect = package_id.clone();
+    // Name of the loaded package. The subscription endpoints key on package
+    // *name*, while the route parameter is a numeric id, so the name has to be
+    // resolved from the fetched package before subscribing.
+    let mut package_name = use_signal(String::new);
 
+    // Load package data.
+    //
+    // `id` and `auth.token()` are read inside the closure so the effect is
+    // subscribed to them and re-runs when the route parameter changes or the
+    // user logs in/out. Previously both were captured as plain clones, so
+    // navigating from /packages/1 to /packages/2 left the first package's data
+    // on screen.
     use_effect(move || {
-        let token_clone = token_for_effect.clone();
-        let pkg_id = package_id_for_effect.clone();
+        let pkg_id = id.clone();
+        let token_clone = auth.token();
+        let is_authenticated = auth.is_authenticated();
+
+        loading.set(true);
         spawn(async move {
             let client = ApiClient::new().with_token(token_clone.clone());
 
-            if let Ok(pkg) = client.get_package(&pkg_id).await {
-                package.set(Some(pkg));
+            let loaded = client.get_package(&pkg_id).await.ok();
+            if let Some(pkg) = &loaded {
+                package_name.set(pkg.name.clone());
             }
+            package.set(loaded.clone());
 
-            if let Ok(vers) = client.get_package_versions(&pkg_id).await {
-                versions.set(vers.clone());
-                let end = (page_size() as usize).min(vers.len());
-                displayed_versions.set(vers[0..end].to_vec());
+            match client.get_package_versions(&pkg_id).await {
+                Ok(vers) => {
+                    let end = (page_size() as usize).min(vers.len());
+                    displayed_versions.set(vers[0..end].to_vec());
+                    versions.set(vers);
+                }
+                Err(_) => {
+                    versions.set(Vec::new());
+                    displayed_versions.set(Vec::new());
+                }
             }
+            current_page.set(0);
 
-            if let Ok(count) = client.get_package_subscribers(&pkg_id).await {
-                subscribers.set(count);
-            }
+            subscribers.set(client.get_package_subscribers(&pkg_id).await.unwrap_or(0));
 
-            // Check if user is subscribed
+            // Check if user is subscribed. Compare against the package we just
+            // loaded rather than re-reading the `package` signal, which may not
+            // have been observed yet.
+            let mut subscribed = false;
+            let mut notifications = false;
             if is_authenticated {
-                if let Ok(subs) = client.get_subscriptions().await {
-                    if let Some(pkg) = package() {
-                        if let Some(sub) = subs.iter().find(|s| s.package_name == pkg.name) {
-                            is_subscribed.set(true);
-                            notifications_enabled.set(sub.notifications_enabled);
-                        }
+                if let (Ok(subs), Some(pkg)) = (client.get_subscriptions().await, &loaded) {
+                    if let Some(sub) = subs.iter().find(|s| s.package_name == pkg.name) {
+                        subscribed = true;
+                        notifications = sub.notifications_enabled;
                     }
                 }
             }
+            is_subscribed.set(subscribed);
+            notifications_enabled.set(notifications);
 
             loading.set(false);
         });
@@ -96,63 +116,75 @@ pub fn PackageDetail(id: String) -> Element {
     let notif = use_notifications();
 
     let token_for_subscribe = token.clone();
-    let package_id_for_subscribe = package_id.clone();
 
     let handle_subscribe = move |_| {
         let mut notif_copy = notif;
         let token_clone = token_for_subscribe.clone();
-        let pkg_id = package_id_for_subscribe.clone();
+        // Subscription endpoints key on package name, not the numeric route id.
+        let pkg_name = package_name();
 
         spawn(async move {
+            if pkg_name.is_empty() {
+                notif_copy.error("Package is still loading".to_string());
+                return;
+            }
+
             let client = ApiClient::new().with_token(token_clone);
 
             if is_subscribed() {
-                // Unsubscribe
-                if let Ok(_) = client.unsubscribe(&pkg_id).await {
-                    is_subscribed.set(false);
-                    notif_copy.success("Unsubscribed successfully".to_string());
-                    // Decrement subscriber count
-                    subscribers.set(subscribers().saturating_sub(1));
-                } else {
-                    notif_copy.error("Failed to unsubscribe".to_string());
+                match client.unsubscribe(&pkg_name).await {
+                    Ok(_) => {
+                        is_subscribed.set(false);
+                        notifications_enabled.set(false);
+                        notif_copy.success("Unsubscribed successfully".to_string());
+                        subscribers.set(subscribers().saturating_sub(1));
+                    }
+                    Err(e) => notif_copy.error(format!("Failed to unsubscribe: {:?}", e)),
                 }
             } else {
-                // Subscribe
-                if let Ok(_) = client.subscribe(pkg_id.clone()).await {
-                    is_subscribed.set(true);
-                    notifications_enabled.set(true);
-                    notif_copy.success("Subscribed successfully".to_string());
-                    // Increment subscriber count
-                    subscribers.set(subscribers() + 1);
-                } else {
-                    notif_copy.error("Failed to subscribe".to_string());
+                match client.subscribe(pkg_name.clone()).await {
+                    Ok(_) => {
+                        is_subscribed.set(true);
+                        notifications_enabled.set(true);
+                        notif_copy.success("Subscribed successfully".to_string());
+                        subscribers.set(subscribers() + 1);
+                    }
+                    Err(e) => notif_copy.error(format!("Failed to subscribe: {:?}", e)),
                 }
             }
         });
     };
 
     let token_for_toggle = token.clone();
-    let package_id_for_toggle = package_id.clone();
 
     let toggle_notifications = move |_| {
         let mut notif_copy = notif;
         let token_clone = token_for_toggle.clone();
-        let pkg_id = package_id_for_toggle.clone();
+        let pkg_name = package_name();
 
         spawn(async move {
+            if pkg_name.is_empty() {
+                notif_copy.error("Package is still loading".to_string());
+                return;
+            }
+
             let client = ApiClient::new().with_token(token_clone);
             let new_state = !notifications_enabled();
 
-            if let Ok(_) = client.toggle_notifications(&pkg_id, new_state).await {
-                notifications_enabled.set(new_state);
-                let msg = if new_state {
-                    "Notifications enabled"
-                } else {
-                    "Notifications disabled"
-                };
-                notif_copy.success(msg.to_string());
-            } else {
-                notif_copy.error("Failed to update notification settings".to_string());
+            match client.toggle_notifications(&pkg_name, new_state).await {
+                Ok(_) => {
+                    notifications_enabled.set(new_state);
+                    let msg = if new_state {
+                        "Notifications enabled"
+                    } else {
+                        "Notifications disabled"
+                    };
+                    notif_copy.success(msg.to_string());
+                }
+                Err(e) => notif_copy.error(format!(
+                    "Failed to update notification settings: {:?}",
+                    e
+                )),
             }
         });
     };
@@ -196,18 +228,20 @@ pub fn PackageDetail(id: String) -> Element {
                             }
 
                             div { class: "flex flex-wrap gap-4",
-                                if let Some(homepage) = &pkg.homepage {
+                                if let Some(homepage) = pkg.homepage.as_deref().and_then(crate::util::safe_external_url) {
                                     a {
                                         href: "{homepage}",
                                         target: "_blank",
+                                        rel: "noopener noreferrer",
                                         class: "px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg transition-colors",
                                         "Homepage"
                                     }
                                 }
-                                if let Some(repository) = &pkg.repository {
+                                if let Some(repository) = pkg.repository.as_deref().and_then(crate::util::safe_external_url) {
                                     a {
                                         href: "{repository}",
                                         target: "_blank",
+                                        rel: "noopener noreferrer",
                                         class: "px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg transition-colors",
                                         "Repository"
                                     }
@@ -298,7 +332,7 @@ pub fn PackageDetail(id: String) -> Element {
                                 }
 
                                 // Subscribe/Notification Actions
-                                if is_authenticated {
+                                if auth.is_authenticated() {
                                     div { class: "bg-gray-800 rounded-2xl shadow-xl p-6 border border-gray-700",
                                         h3 { class: "text-lg font-bold text-gray-100 mb-4", "Actions" }
                                         div { class: "space-y-3",

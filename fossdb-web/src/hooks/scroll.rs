@@ -1,15 +1,21 @@
 use dioxus::prelude::*;
-use wasm_bindgen::prelude::*;
+use std::rc::Rc;
 use wasm_bindgen::JsCast;
-use web_sys::{window, Event};
+use wasm_bindgen::prelude::*;
+use web_sys::{Event, window};
 
 pub fn use_scroll_direction() -> Signal<ScrollDirection> {
     let mut direction = use_signal(|| ScrollDirection::None);
     let mut last_scroll = use_signal(|| 0.0);
 
-    use_effect(move || {
-        let win = window().expect("no global `window` exists");
-
+    // The closure is kept alive by the hook and the listener is removed when the
+    // component unmounts.
+    //
+    // `Closure::forget` leaked a listener on every mount, and the leaked handler
+    // kept reading `direction`/`last_scroll`, which are owned by this
+    // component's scope. Reading a signal after its owner is dropped panics, and
+    // a panic in WASM aborts the whole application.
+    let listener: Rc<Closure<dyn FnMut(Event)>> = use_hook(|| {
         let closure = Closure::wrap(Box::new(move |_: Event| {
             if let Some(w) = window() {
                 let current_scroll = w.scroll_y().unwrap_or(0.0);
@@ -25,10 +31,19 @@ pub fn use_scroll_direction() -> Signal<ScrollDirection> {
             }
         }) as Box<dyn FnMut(Event)>);
 
-        win.add_event_listener_with_callback("scroll", closure.as_ref().unchecked_ref())
-            .expect("failed to add event listener");
+        if let Some(win) = window() {
+            let _ = win
+                .add_event_listener_with_callback("scroll", closure.as_ref().unchecked_ref());
+        }
 
-        closure.forget();
+        Rc::new(closure)
+    });
+
+    use_drop(move || {
+        if let Some(win) = window() {
+            let _ = win
+                .remove_event_listener_with_callback("scroll", listener.as_ref().as_ref().unchecked_ref());
+        }
     });
 
     direction

@@ -2,6 +2,7 @@ mod api;
 mod components;
 mod hooks;
 mod pages;
+mod util;
 
 use dioxus::prelude::*;
 use dioxus_logger::tracing::{info, Level};

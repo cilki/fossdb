@@ -1,5 +1,6 @@
 use crate::api::types::*;
 use crate::api::ApiClient;
+use crate::components::PackageCard;
 use crate::hooks::{use_auth, use_time_ago, use_websocket};
 use dioxus::prelude::*;
 use std::collections::HashSet;
@@ -17,12 +18,17 @@ pub fn Home() -> Element {
     let mut displayed_event_ids = use_signal(|| HashSet::<u64>::new());
 
     let token = auth.token();
-    let is_authenticated = auth.is_authenticated();
 
-    // Load initial data
-    let token_for_effect = token.clone();
+    // Load initial data.
+    //
+    // `auth.token()` / `auth.is_authenticated()` are read inside the closure so
+    // the effect re-runs on login and logout. Capturing them outside meant that
+    // after logging in the heading switched to "Your Timeline" but no timeline
+    // was ever fetched, leaving a permanently empty page until a manual reload.
     use_effect(move || {
-        let token_clone = token_for_effect.clone();
+        let token_clone = auth.token();
+        let is_authenticated = auth.is_authenticated();
+
         spawn(async move {
             let client = ApiClient::new().with_token(token_clone.clone());
 
@@ -42,7 +48,16 @@ pub fn Home() -> Element {
                     timeline_offset.set(20);
                 }
             } else {
-                if let Ok(response) = client.get_packages(None, 1, 6).await {
+                // Reset personal timeline state on logout.
+                displayed_event_ids.set(HashSet::new());
+                timeline_events.set(Vec::new());
+                timeline_total.set(0);
+                timeline_offset.set(0);
+
+                if let Ok(response) = client
+                    .get_packages(crate::api::client::PackageQuery::default(), 1, 6)
+                    .await
+                {
                     latest_packages.set(response.packages);
                 }
             }
@@ -55,18 +70,16 @@ pub fn Home() -> Element {
     // - Unauthenticated users receive global timeline events
     // - Authenticated users receive personalized timeline events
     {
+        // Scheme is derived from the page protocol so HTTPS deployments use
+        // `wss://` instead of being blocked as mixed content.
         let ws_url = if cfg!(debug_assertions) {
             "ws://localhost:3000/ws/timeline".to_string()
         } else {
-            format!(
-                "ws://{}/ws/timeline",
-                web_sys::window()
-                    .and_then(|w| w.location().host().ok())
-                    .unwrap_or_else(|| "localhost:3000".to_string())
-            )
+            crate::hooks::websocket_url("/ws/timeline")
+                .unwrap_or_else(|| "ws://localhost:3000/ws/timeline".to_string())
         };
 
-        use_websocket::<WebSocketMessage, _>(ws_url, move |msg: WebSocketMessage| {
+        let _ws_state = use_websocket::<WebSocketMessage, _>(ws_url, move |msg: WebSocketMessage| {
             match msg {
                 WebSocketMessage::TimelineEvent { event } => {
                     let event_id = event.id;
@@ -156,7 +169,7 @@ pub fn Home() -> Element {
             section { class: "py-24 bg-gray-900",
                 div { class: "container mx-auto px-6",
                     div { class: "text-center mb-16",
-                        if is_authenticated {
+                        if auth.is_authenticated() {
                             h2 { class: "text-4xl font-bold text-gray-100 mb-6", "Your Timeline" }
                             p { class: "text-xl text-gray-300", "Updates from packages you follow" }
                         } else {
@@ -171,8 +184,14 @@ pub fn Home() -> Element {
                                 div { class: "animate-spin rounded-full h-12 w-12 border-b-2 border-blue-500" }
                             }
                         } else {
+                            // `key` is required: new websocket events are
+                            // inserted at the front, shifting every element.
+                            // Without a key dioxus diffs by position and reuses
+                            // each card's scope with different props, so the
+                            // cards' internal state (the "time ago" string)
+                            // ended up attached to the wrong event.
                             for event in timeline_events().iter() {
-                                TimelineEventCard { event: event.clone() }
+                                TimelineEventCard { key: "{event.id}", event: event.clone() }
                             }
 
                             // Load More button
@@ -193,10 +212,27 @@ pub fn Home() -> Element {
 
                             if timeline_events().is_empty() {
                                 div { class: "text-center py-12",
-                                    if is_authenticated {
+                                    if auth.is_authenticated() {
                                         p { class: "text-gray-400 text-lg", "No timeline events yet. Subscribe to packages to see updates here!" }
                                     } else {
-                                        p { class: "text-gray-400 text-lg", "Waiting for new releases..." }
+                                        p { class: "text-gray-400 text-lg mb-8", "Waiting for new releases..." }
+
+                                        // `latest_packages` is fetched for
+                                        // anonymous visitors but was never
+                                        // rendered anywhere, so they only ever
+                                        // saw "Waiting for new releases...".
+                                        if !latest_packages().is_empty() {
+                                            div { class: "text-left",
+                                                h3 { class: "text-2xl font-bold text-gray-100 mb-6 text-center",
+                                                    "Recently Added Packages"
+                                                }
+                                                div { class: "grid grid-cols-1 md:grid-cols-2 gap-4",
+                                                    for pkg in latest_packages().iter() {
+                                                        PackageCard { key: "{pkg.id}", package: pkg.clone() }
+                                                    }
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                             }

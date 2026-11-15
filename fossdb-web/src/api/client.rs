@@ -9,6 +9,34 @@ use web_sys::{Request, RequestInit, RequestMode, Response};
 
 type Result<T> = std::result::Result<T, JsValue>;
 
+/// Percent-encode a value for use in a URL path segment or query value.
+///
+/// Raw interpolation let user input change the request: searching for `c++`
+/// arrived as two spaces, a `#` truncated the query client-side, and `&`
+/// allowed injecting additional parameters such as `limit`.
+pub(crate) fn encode_uri_component(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            _ => out.push_str(&format!("%{:02X}", byte)),
+        }
+    }
+    out
+}
+
+/// Server-side filters for `GET /packages`.
+#[derive(Default, Clone, Copy)]
+pub struct PackageQuery<'a> {
+    pub search: Option<&'a str>,
+    pub tag: Option<&'a str>,
+    pub language: Option<&'a str>,
+    pub license: Option<&'a str>,
+    pub updated_within: Option<&'a str>,
+}
+
 pub struct ApiClient {
     base_url: String,
     token: Option<String>,
@@ -69,7 +97,22 @@ impl ApiClient {
         let resp: Response = resp_value.dyn_into()?;
 
         if !resp.ok() {
-            return Err(JsValue::from_str(&format!("HTTP error: {}", resp.status())));
+            // Include the server's message so the UI can show something better
+            // than the bare string "HTTP error: 401".
+            let status = resp.status();
+            let detail = match resp.text() {
+                Ok(promise) => JsFuture::from(promise)
+                    .await
+                    .ok()
+                    .and_then(|v| v.as_string())
+                    .filter(|body| !body.trim().is_empty()),
+                Err(_) => None,
+            };
+
+            return Err(JsValue::from_str(&match detail {
+                Some(body) => format!("HTTP error {}: {}", status, body),
+                None => format!("HTTP error {}", status),
+            }));
         }
 
         let json = JsFuture::from(
@@ -106,61 +149,110 @@ impl ApiClient {
         self.request("GET", "/stats", None).await
     }
 
+    /// Filters passed to `GET /packages`. Empty values are omitted.
+    ///
+    /// All filtering happens server-side so that the reported `total` (and
+    /// therefore the page count) matches what is actually returned.
     pub async fn get_packages(
         &self,
-        search: Option<String>,
+        filters: PackageQuery<'_>,
         page: u32,
         limit: u32,
     ) -> Result<PackagesResponse> {
         let mut path = format!("/packages?page={}&limit={}", page, limit);
-        if let Some(query) = search {
-            path.push_str(&format!("&search={}", query));
+        for (key, value) in [
+            ("search", filters.search),
+            ("tag", filters.tag),
+            ("language", filters.language),
+            ("license", filters.license),
+            ("updated_within", filters.updated_within),
+        ] {
+            if let Some(value) = value.filter(|v| !v.is_empty()) {
+                path.push_str(&format!("&{}={}", key, encode_uri_component(value)));
+            }
         }
         self.request("GET", &path, None).await
     }
 
     pub async fn get_package(&self, id: &str) -> Result<Package> {
-        self.request("GET", &format!("/packages/{}", id), None)
-            .await
-    }
-
-    pub async fn get_package_versions(&self, id: &str) -> Result<Vec<PackageVersion>> {
-        self.request("GET", &format!("/packages/{}/versions", id), None)
-            .await
-    }
-
-    pub async fn get_package_subscribers(&self, id: &str) -> Result<usize> {
-        #[derive(serde::Deserialize)]
-        struct SubscriberCount {
-            count: usize,
-        }
-        let result: SubscriberCount = self
-            .request("GET", &format!("/packages/{}/subscribers", id), None)
-            .await?;
-        Ok(result.count)
-    }
-
-    pub async fn get_subscriptions(&self) -> Result<Vec<SubscriptionResponse>> {
-        self.request("GET", "/users/subscriptions", None).await
-    }
-
-    pub async fn subscribe(&self, package_name: String) -> Result<()> {
-        let body = serde_json::to_string(&SubscriptionRequest { package_name })
-            .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))?;
-        self.request("POST", "/users/subscriptions", Some(body))
-            .await
-    }
-
-    pub async fn unsubscribe(&self, package_name: &str) -> Result<()> {
         self.request(
-            "DELETE",
-            &format!("/users/subscriptions/{}", package_name),
+            "GET",
+            &format!("/packages/{}", encode_uri_component(id)),
             None,
         )
         .await
     }
 
-    pub async fn toggle_notifications(&self, package_name: &str, enabled: bool) -> Result<()> {
+    pub async fn get_package_versions(&self, id: &str) -> Result<Vec<PackageVersion>> {
+        self.request(
+            "GET",
+            &format!("/packages/{}/versions", encode_uri_component(id)),
+            None,
+        )
+        .await
+    }
+
+    pub async fn get_package_subscribers(&self, id: &str) -> Result<usize> {
+        // The server returns `{package_id, package_name, subscriber_count}`.
+        // Deserializing a non-optional `count` field that does not exist made
+        // this call always fail, so the UI always rendered 0 subscribers.
+        #[derive(serde::Deserialize)]
+        struct SubscriberCount {
+            subscriber_count: usize,
+        }
+        let result: SubscriberCount = self
+            .request(
+                "GET",
+                &format!("/packages/{}/subscribers", encode_uri_component(id)),
+                None,
+            )
+            .await?;
+        Ok(result.subscriber_count)
+    }
+
+    /// The server replies with a `SubscriptionResponse` object wrapping the
+    /// list, not a bare array. Deserializing into `Vec<_>` always failed, so the
+    /// subscriptions page showed "No Subscriptions Yet" to subscribed users and
+    /// package pages never rendered the "Unsubscribe" state.
+    pub async fn get_subscriptions(&self) -> Result<Vec<PackageSubscription>> {
+        let response: SubscriptionResponse =
+            self.request("GET", "/users/subscriptions", None).await?;
+        Ok(response.subscriptions)
+    }
+
+    // The three mutations below return the updated `SubscriptionResponse`.
+    // They were typed as `Result<()>`, and `serde_wasm_bindgen` only
+    // deserializes `()` from null/undefined - so every call reported failure
+    // even though the write had succeeded, and the UI never updated.
+
+    pub async fn subscribe(&self, package_name: String) -> Result<Vec<PackageSubscription>> {
+        let body = serde_json::to_string(&SubscriptionRequest { package_name })
+            .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))?;
+        let response: SubscriptionResponse = self
+            .request("POST", "/users/subscriptions", Some(body))
+            .await?;
+        Ok(response.subscriptions)
+    }
+
+    pub async fn unsubscribe(&self, package_name: &str) -> Result<Vec<PackageSubscription>> {
+        let response: SubscriptionResponse = self
+            .request(
+                "DELETE",
+                &format!(
+                    "/users/subscriptions/{}",
+                    encode_uri_component(package_name)
+                ),
+                None,
+            )
+            .await?;
+        Ok(response.subscriptions)
+    }
+
+    pub async fn toggle_notifications(
+        &self,
+        package_name: &str,
+        enabled: bool,
+    ) -> Result<Vec<PackageSubscription>> {
         #[derive(serde::Serialize)]
         struct NotificationToggle {
             notifications_enabled: bool,
@@ -169,12 +261,17 @@ impl ApiClient {
             notifications_enabled: enabled,
         })
         .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))?;
-        self.request(
-            "PUT",
-            &format!("/users/subscriptions/{}/notifications", package_name),
-            Some(body),
-        )
-        .await
+        let response: SubscriptionResponse = self
+            .request(
+                "PUT",
+                &format!(
+                    "/users/subscriptions/{}/notifications",
+                    encode_uri_component(package_name)
+                ),
+                Some(body),
+            )
+            .await?;
+        Ok(response.subscriptions)
     }
 
     pub async fn get_timeline(&self, offset: usize, limit: usize) -> Result<TimelineResponse> {

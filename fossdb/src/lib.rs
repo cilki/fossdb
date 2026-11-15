@@ -157,10 +157,14 @@ pub struct SubscriptionRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+/// Body returned by every `/users/subscriptions` endpoint.
+///
+/// This is the single definition of the wire format. The server previously
+/// declared its own local `SubscriptionResponse { subscriptions }` that shadowed
+/// this type, while this one described a completely different shape - so the
+/// client could never deserialize what the server actually sent.
 pub struct SubscriptionResponse {
-    pub package_name: String,
-    pub notifications_enabled: bool,
-    pub package: Option<Package>,
+    pub subscriptions: Vec<PackageSubscription>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -259,6 +263,9 @@ pub struct AnalysisFinding {
 pub enum FindingKind {
     LicenseDetected,
     LicenseMismatch,
+    /// A license file exists but its text matched none of the known licenses.
+    /// Distinct from a missing license file and from a mismatch.
+    LicenseUnrecognized,
     SecretDetected,
     ChecksumMismatch,
     BinaryMetadata,

@@ -1,6 +1,6 @@
 use crate::api::types::Package;
 use crate::api::ApiClient;
-use crate::components::{use_comparison, PackageCard};
+use crate::components::PackageCard;
 use crate::hooks::{use_auth, LocalStorage, StorageKey};
 use dioxus::prelude::*;
 
@@ -44,48 +44,50 @@ pub fn Packages() -> Element {
         LocalStorage::get::<String>(StorageKey::ViewMode).unwrap_or_else(|| "grid".to_string())
     });
 
-    let token = auth.token();
     let mut search_trigger = use_signal(|| 0);
+    // Monotonic id so a slow earlier response cannot overwrite a newer one.
+    let mut request_id = use_signal(|| 0u64);
 
-    // Search effect - runs when search_trigger or current_page changes
+    // Search effect - runs when search_trigger or current_page changes.
+    //
+    // `filters` is read with `peek()` rather than `filters()` on purpose. A
+    // tracked read subscribed this effect to the whole filter struct, and the
+    // search box writes it on every keystroke - so typing "serde" fired five
+    // full `/api/packages` requests and defeated the explicit
+    // search_trigger/Enter design.
     use_effect(move || {
-        let _ = search_trigger(); // Subscribe to changes
+        let _ = search_trigger(); // Subscribe to explicit search requests.
         let page = current_page();
-        let filter_state = filters();
-        let token_clone = token.clone();
+        let filter_state = filters.peek().clone();
+        let token_clone = auth.token();
+
+        let id = *request_id.peek() + 1;
+        request_id.set(id);
 
         spawn(async move {
             loading.set(true);
             let client = ApiClient::new().with_token(token_clone);
 
-            let query = if filter_state.search.is_empty() {
-                None
-            } else {
-                Some(filter_state.search.clone())
+            let query = crate::api::client::PackageQuery {
+                search: Some(filter_state.search.as_str()),
+                tag: Some(filter_state.category.as_str()),
+                language: Some(filter_state.language.as_str()),
+                license: Some(filter_state.license.as_str()),
+                updated_within: Some(filter_state.date_range.as_str()),
             };
 
-            if let Ok(response) = client.get_packages(query, page, page_size).await {
+            let result = client.get_packages(query, page, page_size).await;
+
+            // Discard the result if another search has started since.
+            if *request_id.peek() != id {
+                return;
+            }
+
+            if let Ok(response) = result {
                 let mut pkg_list = response.packages;
 
-                // Apply client-side filters
-                if !filter_state.language.is_empty() {
-                    pkg_list.retain(|p| {
-                        p.language
-                            .as_ref()
-                            .map(|l| l.eq_ignore_ascii_case(&filter_state.language))
-                            .unwrap_or(false)
-                    });
-                }
-                if !filter_state.license.is_empty() {
-                    pkg_list.retain(|p| {
-                        p.license
-                            .as_ref()
-                            .map(|l| l.eq_ignore_ascii_case(&filter_state.license))
-                            .unwrap_or(false)
-                    });
-                }
-
-                // Apply sorting
+                // Filtering is done server-side (before pagination) so `total`
+                // and the page count stay consistent with the rows returned.
                 match filter_state.sort.as_str() {
                     "name" => pkg_list.sort_by(|a, b| a.name.cmp(&b.name)),
                     "-created_at" => pkg_list.sort_by(|a, b| b.created_at.cmp(&a.created_at)),
@@ -112,7 +114,7 @@ pub fn Packages() -> Element {
         let _ = LocalStorage::set(StorageKey::ViewMode, &mode.to_string());
     };
 
-    let mut clear_filters = move |_| {
+    let clear_filters = move |_| {
         filters.set(PackageFilters::default());
         perform_search();
     };
