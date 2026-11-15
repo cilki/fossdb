@@ -6,7 +6,6 @@ pub enum StorageKey {
     /// [`crate::hooks::auth`].
     UserId,
     UserData,
-    Subscriptions,
     ViewMode,
 }
 
@@ -15,7 +14,6 @@ impl StorageKey {
         match self {
             StorageKey::UserId => "user_id",
             StorageKey::UserData => "user_data",
-            StorageKey::Subscriptions => "subscriptions",
             StorageKey::ViewMode => "view_mode",
         }
     }
@@ -37,9 +35,5 @@ impl LocalStorage {
 
     pub fn remove(key: StorageKey) {
         GlooLocalStorage::delete(key.as_str());
-    }
-
-    pub fn clear() {
-        GlooLocalStorage::clear();
     }
 }

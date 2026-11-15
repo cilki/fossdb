@@ -7,7 +7,7 @@
 //! credential does not expire, so a leak is permanent until the account is
 //! abandoned.
 
-use crate::api::{ApiClient, types::*};
+use crate::api::types::*;
 use crate::hooks::storage::{LocalStorage, StorageKey};
 use dioxus::prelude::*;
 
@@ -69,7 +69,6 @@ impl AuthContext {
     pub fn logout(&mut self) {
         LocalStorage::remove(StorageKey::UserId);
         LocalStorage::remove(StorageKey::UserData);
-        LocalStorage::remove(StorageKey::Subscriptions);
 
         let mut state = self.auth_state.write();
         state.user_id = None;

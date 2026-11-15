@@ -5,7 +5,7 @@ mod pages;
 mod util;
 
 use dioxus::prelude::*;
-use dioxus_logger::tracing::{info, Level};
+use dioxus_logger::tracing::Level;
 
 use components::{ComparisonBar, Navigation, NotificationContainer};
 use hooks::{use_keyboard_shortcut, KeyPress};

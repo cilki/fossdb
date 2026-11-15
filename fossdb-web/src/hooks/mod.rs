@@ -6,7 +6,7 @@ pub mod storage;
 pub mod time_ago;
 pub mod websocket;
 
-pub use auth::{use_auth, AuthState};
+pub use auth::use_auth;
 pub use keyboard::{use_keyboard_shortcut, KeyPress};
 pub use notifications::{
     use_notifications, Notification, NotificationContext, NotificationState, NotificationType,

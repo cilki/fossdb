@@ -1,8 +1,6 @@
 use super::types::*;
 use fossdb::url::percent_encode;
-use gloo_console::log;
 use serde::de::DeserializeOwned;
-use serde::Serialize;
 use wasm_bindgen::JsCast;
 use wasm_bindgen::JsValue;
 use wasm_bindgen_futures::JsFuture;
@@ -58,12 +56,12 @@ impl ApiClient {
     ) -> Result<T> {
         let url = format!("{}{}", self.base_url, path);
 
-        let mut opts = RequestInit::new();
-        opts.method(method);
-        opts.mode(RequestMode::Cors);
+        let opts = RequestInit::new();
+        opts.set_method(method);
+        opts.set_mode(RequestMode::Cors);
 
         if let Some(body_str) = body {
-            opts.body(Some(&JsValue::from_str(&body_str)));
+            opts.set_body(&JsValue::from_str(&body_str));
         }
 
         let request = Request::new_with_str_and_init(&url, &opts)?;
@@ -294,11 +292,5 @@ impl ApiClient {
             None,
         )
         .await
-    }
-}
-
-impl Default for ApiClient {
-    fn default() -> Self {
-        Self::new()
     }
 }

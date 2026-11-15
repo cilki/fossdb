@@ -22,29 +22,10 @@ macro_rules! impl_insert {
             Ok(entity)
         }
     };
-    (#[allow(dead_code)] $method:ident, $type:ty, $id_gen:ident) => {
-        #[allow(dead_code)]
-        pub fn $method(&self, mut entity: $type) -> Result<$type> {
-            if entity.id == 0 {
-                entity.id = self.$id_gen.next();
-            }
-            let rw = self.db.rw_transaction()?;
-            rw.insert(entity.clone())?;
-            rw.commit()?;
-            Ok(entity)
-        }
-    };
 }
 
 macro_rules! impl_get {
     ($method:ident, $type:ty) => {
-        pub fn $method(&self, id: u64) -> Result<Option<$type>> {
-            let r = self.db.r_transaction()?;
-            Ok(r.get().primary(id)?)
-        }
-    };
-    (#[allow(dead_code)] $method:ident, $type:ty) => {
-        #[allow(dead_code)]
         pub fn $method(&self, id: u64) -> Result<Option<$type>> {
             let r = self.db.r_transaction()?;
             Ok(r.get().primary(id)?)
@@ -104,7 +85,6 @@ pub struct Database {
     pub db: native_db::Database<'static>,
     package_ids: Arc<IdGenerator>,
     version_ids: Arc<IdGenerator>,
-    #[allow(dead_code)]
     vulnerability_ids: Arc<IdGenerator>,
     timeline_ids: Arc<IdGenerator>,
     analysis_ids: Arc<IdGenerator>,
@@ -202,11 +182,7 @@ impl Database {
     impl_update!(update_package, Package);
 
     impl_insert!(insert_version, PackageVersion, version_ids);
-    impl_get!(
-        #[allow(dead_code)]
-        get_version,
-        PackageVersion
-    );
+    impl_get!(get_version, PackageVersion);
 
     pub fn get_versions_by_package(&self, package_id: u64) -> Result<Vec<PackageVersion>> {
         let r = self.db.r_transaction()?;
@@ -283,38 +259,13 @@ impl Database {
         Ok(true)
     }
 
-    impl_insert!(
-        #[allow(dead_code)]
-        insert_vulnerability,
-        Vulnerability,
-        vulnerability_ids
-    );
-    impl_get!(
-        #[allow(dead_code)]
-        get_vulnerability,
-        Vulnerability
-    );
+    impl_insert!(insert_vulnerability, Vulnerability, vulnerability_ids);
+    impl_get!(get_vulnerability, Vulnerability);
     impl_get_all!(get_all_vulnerabilities, Vulnerability);
 
     impl_insert!(insert_timeline_event, TimelineEvent, timeline_ids);
-    impl_get!(
-        #[allow(dead_code)]
-        get_timeline_event,
-        TimelineEvent
-    );
+    impl_get!(get_timeline_event, TimelineEvent);
     impl_get_all!(get_all_timeline_events, TimelineEvent);
-
-    #[allow(dead_code)]
-    pub fn get_timeline_by_package(&self, package_id: u64) -> Result<Vec<TimelineEvent>> {
-        let r = self.db.r_transaction()?;
-        let events: Vec<TimelineEvent> = r
-            .scan()
-            .secondary(TimelineEventKey::package_id)?
-            .start_with(package_id)?
-            .collect::<Result<Vec<_>, _>>()?;
-        Ok(events)
-    }
-
     impl_update!(update_timeline_event, TimelineEvent);
 
     pub fn get_timeline_events_by_user(&self, user_id: &str) -> Result<Vec<TimelineEvent>> {
@@ -376,7 +327,6 @@ impl Database {
     }
 
     impl_insert!(insert_worker_analysis, WorkerAnalysis, analysis_ids);
-    impl_get!(get_worker_analysis, WorkerAnalysis);
     impl_get_all!(get_all_analyses, WorkerAnalysis);
 
     pub fn get_analyses_by_package(&self, package_id: u64) -> Result<Vec<WorkerAnalysis>> {

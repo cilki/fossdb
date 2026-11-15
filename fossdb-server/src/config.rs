@@ -10,8 +10,6 @@ use std::env;
 pub struct Config {
     pub database_path: String,
     pub server_port: u16,
-    pub libraries_io_api_key: Option<String>,
-    pub collector_interval_hours: u64,
     pub timeline_retention_days: u64,
     /// Address the public API binds to.
     pub bind_address: String,
@@ -42,8 +40,6 @@ impl Config {
         Self {
             database_path: env::var("DATABASE_PATH").unwrap_or_else(|_| "./foss.db".to_string()),
             server_port: parse_or("SERVER_PORT", 3000),
-            libraries_io_api_key: env::var("LIBRARIES_IO_API_KEY").ok(),
-            collector_interval_hours: parse_or("COLLECTOR_INTERVAL_HOURS", 1),
             timeline_retention_days: parse_or("TIMELINE_RETENTION_DAYS", 90),
             bind_address: env::var("BIND_ADDRESS").unwrap_or_else(|_| "0.0.0.0".to_string()),
             collector_port: parse_or("COLLECTOR_PORT", 3001),

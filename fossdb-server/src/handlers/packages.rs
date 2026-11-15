@@ -16,7 +16,6 @@ use crate::lookalike::LookalikeTargets;
 use crate::{AppState, Package, PackageVersion};
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 pub struct ListPackagesQuery {
     page: Option<u32>,
     limit: Option<u32>,

@@ -57,10 +57,6 @@ impl ComparisonContext {
         self.state.write().packages.clear();
     }
 
-    pub fn count(&self) -> usize {
-        self.state.read().packages.len()
-    }
-
     pub fn contains(&self, package_id: u64) -> bool {
         self.state.read().packages.iter().any(|p| p.id == package_id)
     }
