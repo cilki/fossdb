@@ -165,7 +165,7 @@ async fn start_server(config: Config) -> Result<()> {
     let worker_api = Router::new()
         .route("/packages/next", get(handlers::worker::get_task))
         .route("/analysis", post(handlers::worker::submit_analysis))
-        .route("/packages/:package_id/analyses", get(handlers::worker::get_package_analyses))
+        .route("/packages/{package_id}/analyses", get(handlers::worker::get_package_analyses))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::worker_auth_middleware,
@@ -186,7 +186,7 @@ async fn start_server(config: Config) -> Result<()> {
     let collector_api = Router::new()
         .route("/packages", get(handlers::collector::get_package))
         .route("/packages", post(handlers::collector::upsert_package))
-        .route("/packages/:name/timestamp", put(handlers::collector::update_package_timestamp))
+        .route("/packages/{name}/timestamp", put(handlers::collector::update_package_timestamp))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::collector_auth_middleware,
