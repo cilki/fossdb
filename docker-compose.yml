@@ -1,29 +1,33 @@
 services:
   fossdb:
     build:
-      context: ./fossdb
+      # The workspace root: fossdb-server is a member crate and cannot be
+      # built from its own directory alone.
+      context: .
+      dockerfile: fossdb-server/Dockerfile
     environment:
       - DATABASE_PATH=/data/fossdb.db
-      - JWT_SECRET=your-secret-key-change-this
       - SERVER_PORT=3000
+      # Collector and worker keys are not set here: they are stored in the
+      # database and minted with `fossdb admin api-key create`, which needs
+      # the admin socket mounted (see volumes below).
+      # Feed documents need absolute URLs, so this must match the origin
+      # users actually reach.
+      - PUBLIC_BASE_URL=${PUBLIC_BASE_URL:-http://localhost:3000}
       - LIBRARIES_IO_API_KEY=${LIBRARIES_IO_API_KEY:-}
       - COLLECTOR_INTERVAL_HOURS=1
+      - ACCOUNT_GRACE_HOURS=4
+      - TIMELINE_RETENTION_DAYS=90
       - RUST_LOG=info
     ports:
+      # Public API only. The collector (3001) and worker (3002) APIs are
+      # protected by a shared key alone and must stay off the public network.
       - "3000:3000"
     volumes:
       - fossdb_data:/data
-    restart: unless-stopped
-
-  nginx:
-    image: nginx:alpine
-    ports:
-      - "80:80"
-    volumes:
-      - ./frontend:/usr/share/nginx/html
-      - ./nginx.conf:/etc/nginx/nginx.conf
-    depends_on:
-      - fossdb
+      # Mount a host directory here to reach the admin socket from outside
+      # the container:
+      #   - ./run:/run/fossdb
     restart: unless-stopped
 
 volumes:

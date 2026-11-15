@@ -59,14 +59,14 @@ pub fn Packages() -> Element {
         let _ = search_trigger(); // Subscribe to explicit search requests.
         let page = current_page();
         let filter_state = filters.peek().clone();
-        let token_clone = auth.token();
+        let credential = auth.user_id();
 
         let id = *request_id.peek() + 1;
         request_id.set(id);
 
         spawn(async move {
             loading.set(true);
-            let client = ApiClient::new().with_token(token_clone);
+            let client = ApiClient::new().with_user_id(credential);
 
             let query = crate::api::client::PackageQuery {
                 search: Some(filter_state.search.as_str()),

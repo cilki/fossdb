@@ -62,27 +62,24 @@ impl PackageVersion {
 
 impl_deref!(PackageVersion, fossdb::PackageVersion);
 
+/// Version 2 dropped password/email/username authentication in favour of a
+/// single random credential, which is now the primary key. There is
+/// deliberately no `from` migration: a v1 row has no credential to carry
+/// forward, and inventing one would strand the account's owner. v1 rows must
+/// be cleared - see [`crate::db::Database::preflight`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
-#[native_model(id = 3, version = 1)]
+#[native_model(id = 3, version = 2)]
 #[native_db(
-    primary_key(id -> u64),
-    secondary_key(email -> String, unique),
-    secondary_key(username -> String, unique),
+    primary_key(user_id -> String),
 )]
 pub struct User {
     pub inner: fossdb::User,
 }
 
 impl User {
-    fn id(&self) -> u64 {
-        self.id
-    }
-    fn email(&self) -> String {
-        self.email.clone()
-    }
-    fn username(&self) -> String {
-        self.username.clone()
+    fn user_id(&self) -> String {
+        self.user_id.clone()
     }
 }
 
@@ -106,13 +103,16 @@ impl Vulnerability {
 
 impl_deref!(Vulnerability, fossdb::Vulnerability);
 
+/// Version 2 follows `User` v2: the owning account is now identified by its
+/// string credential rather than a numeric id, and the `notified_at` email
+/// bookkeeping field is gone.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
-#[native_model(id = 5, version = 1)]
+#[native_model(id = 5, version = 2)]
 #[native_db(
     primary_key(id -> u64),
     secondary_key(package_id -> u64),
-    secondary_key(user_id -> Option<u64>, optional),
+    secondary_key(user_id -> Option<String>, optional),
 )]
 pub struct TimelineEvent {
     pub inner: fossdb::TimelineEvent,
@@ -125,8 +125,8 @@ impl TimelineEvent {
     fn package_id(&self) -> u64 {
         self.package_id
     }
-    fn user_id(&self) -> Option<u64> {
-        self.user_id
+    fn user_id(&self) -> Option<String> {
+        self.user_id.clone()
     }
 }
 
@@ -157,3 +157,25 @@ impl WorkerAnalysis {
 }
 
 impl_deref!(WorkerAnalysis, fossdb::WorkerAnalysis);
+
+/// Collector and worker API keys.
+///
+/// Keyed by the non-secret key id so that authentication is a single
+/// primary-key lookup rather than a scan over every key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+#[native_model(id = 7, version = 1)]
+#[native_db(
+    primary_key(key_id -> String),
+)]
+pub struct ApiKey {
+    pub inner: fossdb::ApiKey,
+}
+
+impl ApiKey {
+    fn key_id(&self) -> String {
+        self.key_id.clone()
+    }
+}
+
+impl_deref!(ApiKey, fossdb::ApiKey);

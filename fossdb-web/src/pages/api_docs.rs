@@ -76,10 +76,13 @@ pub fn ApiDocs() -> Element {
                                     span { class: "px-3 py-1 bg-purple-900 text-purple-300 rounded-full text-sm font-medium", "POST" }
                                     code { class: "text-lg font-mono text-gray-200", "/auth/register" }
                                 }
-                                p { class: "text-gray-400 mb-3", "Register new user (returns JWT token)" }
+                                p { class: "text-gray-400 mb-3",
+                                    "Create an account. The server mints a random account ID \
+                                     and returns it once; it is not recoverable."
+                                }
                                 div { class: "text-sm text-gray-400",
                                     strong { "Body:" }
-                                    " username, email, password"
+                                    " none"
                                 }
                             }
 
@@ -89,10 +92,13 @@ pub fn ApiDocs() -> Element {
                                     span { class: "px-3 py-1 bg-purple-900 text-purple-300 rounded-full text-sm font-medium", "POST" }
                                     code { class: "text-lg font-mono text-gray-200", "/auth/login" }
                                 }
-                                p { class: "text-gray-400 mb-3", "Authenticate (returns JWT token)" }
+                                p { class: "text-gray-400 mb-3",
+                                    "Check that an account ID is valid. No token is issued - \
+                                     the ID itself is the credential."
+                                }
                                 div { class: "text-sm text-gray-400",
                                     strong { "Body:" }
-                                    " email, password"
+                                    " user_id"
                                 }
                             }
 
@@ -116,14 +122,37 @@ pub fn ApiDocs() -> Element {
                                 p { class: "text-gray-400", "Get personal timeline (paginated)" }
                             }
 
+                            // Feeds
+                            div { class: "border-l-4 border-blue-500 pl-6",
+                                div { class: "flex items-center gap-3 mb-3",
+                                    span { class: "px-3 py-1 bg-blue-900 text-blue-300 rounded-full text-sm font-medium", "GET" }
+                                    code { class: "text-lg font-mono text-gray-200",
+                                        "/feed/{{user_id}}/atom.xml"
+                                    }
+                                }
+                                p { class: "text-gray-400 mb-3",
+                                    "Atom feed of new releases for a subscribed account. \
+                                     An RSS 2.0 version is at /feed/{{user_id}}/rss.xml."
+                                }
+                                div { class: "text-sm text-gray-400",
+                                    strong { "Auth:" }
+                                    " the account ID in the path. Supports ETag and \
+                                      If-Modified-Since."
+                                }
+                            }
+
                             // Notes
                             div { class: "mt-8 p-4 bg-gray-900 rounded-lg border border-gray-700",
                                 h3 { class: "text-sm font-semibold text-gray-300 mb-2", "Notes" }
                                 ul { class: "text-sm text-gray-400 space-y-1",
-                                    li { "• All responses are JSON" }
-                                    li { "• JWT tokens expire after 7 days" }
-                                    li { "• Protected endpoints return 401 if token is missing/invalid" }
-                                    li { "• Configure base URL via FOSSDB_API_URL environment variable" }
+                                    li { "• All responses are JSON, except feeds, which are XML" }
+                                    li { "• Authenticate with Authorization: Bearer <account-id>" }
+                                    li { "• Account IDs do not expire, and there is no password \
+                                          or email - treat the ID as a secret" }
+                                    li { "• Protected endpoints return 401 if the ID is missing, \
+                                          malformed, or names no account" }
+                                    li { "• Accounts with no subscriptions are deleted \
+                                          automatically a few hours after creation" }
                                 }
                             }
                         }

@@ -1,7 +1,7 @@
 pub use fossdb::{
     AffectedPackage, AnalysisFinding, AuthResponse, CreatePackageRequest, DatabaseStats,
     Dependency, EventType, FindingKind, FindingSeverity, LoginRequest, PackageSubscription,
-    PackagesResponse, RegisterRequest, SubscriptionRequest, SubscriptionResponse,
+    PackagesResponse, RegisterResponse, SubscriptionRequest, SubscriptionResponse,
     TimelineEventType, TimelineResponse, UserResponse, VulnerabilitySeverity, WebSocketMessage,
     WorkerTask,
 };
@@ -13,21 +13,30 @@ pub mod id_generator;
 #[cfg(feature = "db")]
 pub mod models;
 #[cfg(feature = "db")]
-pub use models::{Package, PackageVersion, TimelineEvent, User, Vulnerability, WorkerAnalysis};
+pub use models::{
+    ApiKey, Package, PackageVersion, TimelineEvent, User, Vulnerability, WorkerAnalysis,
+};
 
-#[cfg(feature = "api-server")]
-pub mod auth;
+#[cfg(all(feature = "api-server", unix))]
+pub mod admin;
 #[cfg(feature = "api-server")]
 pub mod claims;
-// Read by both the API server and the email service.
-#[cfg(any(feature = "api-server", feature = "email"))]
+#[cfg(feature = "api-server")]
 pub mod config;
 #[cfg(feature = "api-server")]
 pub mod db_listener;
 #[cfg(feature = "api-server")]
+pub mod feed;
+#[cfg(feature = "api-server")]
+pub mod key_activity;
+#[cfg(feature = "api-server")]
 pub mod handlers;
 #[cfg(feature = "api-server")]
 pub mod middleware;
+#[cfg(feature = "api-server")]
+pub mod api_key;
+#[cfg(feature = "api-server")]
+pub mod user_id;
 #[cfg(feature = "api-server")]
 pub mod websocket;
 
@@ -37,18 +46,20 @@ pub mod websocket;
 pub struct AppState {
     pub db: std::sync::Arc<db::Database>,
     pub broadcaster: std::sync::Arc<websocket::TimelineBroadcaster>,
-    pub collector_api_key: String,
-    pub worker_api_key: String,
+    /// Last-seen timestamps per API key, powering the admin reports.
+    ///
+    /// In memory only; see [`key_activity::KeyActivity`]. Collector and
+    /// worker keys themselves live in the database and are managed through
+    /// the admin socket, so there is no shared secret held here.
+    pub key_activity: std::sync::Arc<std::sync::Mutex<key_activity::KeyActivity>>,
     /// Version IDs currently claimed by a worker, preventing double-assignment.
     /// Claims expire, so a worker that dies mid-task does not block its version
     /// forever. See [`claims::ClaimSet`].
     pub claimed_versions: std::sync::Arc<std::sync::Mutex<claims::ClaimSet>>,
+    /// Absolute origin this server is reachable at, used to build the
+    /// self-referential links that feed readers require.
+    pub public_base_url: String,
+    /// Process start time, reported by the admin socket.
+    pub started_at: chrono::DateTime<chrono::Utc>,
 }
-
-#[cfg(feature = "email")]
-pub mod email;
-
-// The notification processor reads pending events from the database.
-#[cfg(all(feature = "db", feature = "email"))]
-pub mod notifications;
 

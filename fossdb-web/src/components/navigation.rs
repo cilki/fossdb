@@ -13,7 +13,9 @@ pub fn Navigation() -> Element {
     let notif = crate::hooks::use_notifications();
 
     let is_authenticated = auth.is_authenticated();
-    let username = auth.user().as_ref().map(|u| u.username.clone());
+    // Accounts have no display name - only the credential. Show a redacted
+    // form so the page never renders the full secret.
+    let account_label = auth.user_id().map(|id| fossdb::user_id::redact(&id));
 
     // Auto-hide navigation on scroll down
     let nav_class = if scroll_direction() == ScrollDirection::Down {
@@ -65,8 +67,10 @@ pub fn Navigation() -> Element {
                         // Auth buttons
                         if is_authenticated {
                             div { class: "flex items-center space-x-3",
-                                span { class: "text-gray-300 font-medium",
-                                    "{username.as_deref().unwrap_or(\"\")}"
+                                span {
+                                    class: "text-gray-400 font-mono text-sm",
+                                    title: "Your account ID (truncated)",
+                                    "{account_label.clone().unwrap_or_default()}"
                                 }
                                 button {
                                     class: "px-4 py-2 bg-red-500 hover:bg-red-600 text-white rounded-lg font-medium transition-all",

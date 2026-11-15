@@ -8,7 +8,8 @@ use serde_json::Value;
 
 // `SubscriptionRequest`/`SubscriptionResponse` come from the shared `fossdb`
 // crate so the client cannot drift out of sync with the wire format.
-use crate::{AppState, PackageSubscription, SubscriptionRequest, SubscriptionResponse, auth::Claims};
+use crate::middleware::AuthedUser;
+use crate::{AppState, PackageSubscription, SubscriptionRequest, SubscriptionResponse};
 
 #[derive(Debug, Deserialize)]
 pub struct UpdatePackageNotificationRequest {
@@ -31,40 +32,58 @@ pub struct TimelineQuery {
     offset: Option<usize>,
 }
 
+/// Fetch the caller's account, mapping the two failure modes apart.
+///
+/// `NOT_FOUND` here means the credential authenticated but the account has
+/// since been deleted - most likely reaped by the unsubscribed-account purge
+/// between the middleware lookup and this one.
+fn load_user(state: &AppState, authed: &AuthedUser) -> Result<crate::models::User, StatusCode> {
+    state
+        .db
+        .get_user(&authed.user_id)
+        .map_err(|e| {
+            tracing::error!("account lookup failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?
+        .ok_or(StatusCode::NOT_FOUND)
+}
+
 pub async fn get_timeline(
     State(state): State<AppState>,
     Query(params): Query<TimelineQuery>,
-    claims: Option<Extension<Claims>>,
+    authed: Option<Extension<AuthedUser>>,
 ) -> Result<Json<Value>, StatusCode> {
-    // If user is logged in, return their personal timeline (paginated)
-    // Otherwise, return the global timeline (generated dynamically from recent versions)
-    let is_authenticated = claims.is_some();
-    let mut db_events = if let Some(Extension(claims)) = claims {
-        // User is logged in - get their personal timeline
-        let user_id: u64 = claims.sub.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    // Signed in: the account's personal, persisted timeline, paginated.
+    // Anonymous: a global timeline synthesised from recent package versions.
+    let is_authenticated = authed.is_some();
 
-        state
+    let mut db_events = if let Some(Extension(authed)) = authed {
+        let mut events = state
             .db
-            .get_timeline_events_by_user(user_id)
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
+            .get_timeline_events_by_user(&authed.user_id)
+            .map_err(|e| {
+                tracing::error!("timeline lookup failed: {e}");
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+
+        // Newest first. The secondary-key scan returns insertion order, which
+        // is only incidentally chronological.
+        events.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+        events
     } else {
-        // No user logged in - generate global timeline dynamically from recent package versions
-        use crate::{TimelineEvent, EventType};
+        use crate::{EventType, TimelineEvent};
 
         let mut versions = state
             .db
             .get_all_versions()
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        // Sort by release date (most recent first)
         versions.sort_by(|a, b| b.release_date.cmp(&a.release_date));
 
-        // Take the 50 most recent versions and convert to timeline events
         versions
             .into_iter()
             .take(50)
             .filter_map(|version| {
-                // Get package name
                 state
                     .db
                     .get_package(version.package_id)
@@ -79,10 +98,9 @@ pub async fn get_timeline(
                                 event_type: EventType::NewRelease,
                                 package_name: package.name.clone(),
                                 version: Some(version.version.clone()),
-                                message: format!("New version {} released", version_str),
+                                message: format!("New version {version_str} released"),
                                 metadata: None,
                                 created_at: version.release_date,
-                                notified_at: None,
                             },
                         }
                     })
@@ -90,8 +108,8 @@ pub async fn get_timeline(
             .collect()
     };
 
-    // For personal timelines, apply pagination
     let total = db_events.len();
+
     if is_authenticated {
         let limit = params.limit.unwrap_or(20).min(100);
         let offset = params.offset.unwrap_or(0);
@@ -105,24 +123,15 @@ pub async fn get_timeline(
             "offset": offset
         })))
     } else {
-        // Global timeline - no pagination metadata
-        Ok(Json(serde_json::json!({
-            "events": db_events
-        })))
+        Ok(Json(serde_json::json!({ "events": db_events })))
     }
 }
 
 pub async fn get_subscriptions(
     State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
+    Extension(authed): Extension<AuthedUser>,
 ) -> Result<Json<SubscriptionResponse>, StatusCode> {
-    let user_id: u64 = claims.sub.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    let user = state
-        .db
-        .get_user(user_id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let user = load_user(&state, &authed)?;
 
     Ok(Json(SubscriptionResponse {
         subscriptions: user.subscriptions.clone(),
@@ -131,18 +140,11 @@ pub async fn get_subscriptions(
 
 pub async fn add_subscription(
     State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
+    Extension(authed): Extension<AuthedUser>,
     Json(payload): Json<SubscriptionRequest>,
 ) -> Result<Json<SubscriptionResponse>, StatusCode> {
-    let user_id: u64 = claims.sub.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut user = load_user(&state, &authed)?;
 
-    let mut user = state
-        .db
-        .get_user(user_id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    // Verify package exists
     if state
         .db
         .get_package_by_name(&payload.package_name)
@@ -152,7 +154,6 @@ pub async fn add_subscription(
         return Err(StatusCode::NOT_FOUND);
     }
 
-    // Add subscription if not already subscribed
     if !user
         .subscriptions
         .iter()
@@ -160,7 +161,7 @@ pub async fn add_subscription(
     {
         user.subscriptions.push(PackageSubscription {
             package_name: payload.package_name,
-            notifications_enabled: true, // Default to enabled
+            notifications_enabled: true,
         });
         state
             .db
@@ -175,16 +176,10 @@ pub async fn add_subscription(
 
 pub async fn remove_subscription(
     State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
+    Extension(authed): Extension<AuthedUser>,
     Path(package_name): Path<String>,
 ) -> Result<Json<SubscriptionResponse>, StatusCode> {
-    let user_id: u64 = claims.sub.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    let mut user = state
-        .db
-        .get_user(user_id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let mut user = load_user(&state, &authed)?;
 
     user.subscriptions
         .retain(|s| s.package_name != package_name);
@@ -201,15 +196,9 @@ pub async fn remove_subscription(
 
 pub async fn get_notification_settings(
     State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
+    Extension(authed): Extension<AuthedUser>,
 ) -> Result<Json<NotificationSettingsResponse>, StatusCode> {
-    let user_id: u64 = claims.sub.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    let user = state
-        .db
-        .get_user(user_id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let user = load_user(&state, &authed)?;
 
     Ok(Json(NotificationSettingsResponse {
         notifications_enabled: user.notifications_enabled,
@@ -218,16 +207,10 @@ pub async fn get_notification_settings(
 
 pub async fn update_notification_settings(
     State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
+    Extension(authed): Extension<AuthedUser>,
     Json(payload): Json<NotificationSettingsRequest>,
 ) -> Result<Json<NotificationSettingsResponse>, StatusCode> {
-    let user_id: u64 = claims.sub.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
-
-    let mut user = state
-        .db
-        .get_user(user_id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
+    let mut user = load_user(&state, &authed)?;
 
     user.notifications_enabled = payload.notifications_enabled;
 
@@ -243,35 +226,28 @@ pub async fn update_notification_settings(
 
 pub async fn update_package_notification(
     State(state): State<AppState>,
-    Extension(claims): Extension<Claims>,
+    Extension(authed): Extension<AuthedUser>,
     Path(package_name): Path<String>,
     Json(payload): Json<UpdatePackageNotificationRequest>,
 ) -> Result<Json<SubscriptionResponse>, StatusCode> {
-    let user_id: u64 = claims.sub.parse().map_err(|_| StatusCode::BAD_REQUEST)?;
+    let mut user = load_user(&state, &authed)?;
 
-    let mut user = state
-        .db
-        .get_user(user_id)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .ok_or(StatusCode::NOT_FOUND)?;
-
-    // Find and update the subscription
-    if let Some(subscription) = user
+    let Some(subscription) = user
         .subscriptions
         .iter_mut()
         .find(|s| s.package_name == package_name)
-    {
-        subscription.notifications_enabled = payload.notifications_enabled;
+    else {
+        return Err(StatusCode::NOT_FOUND);
+    };
 
-        state
-            .db
-            .update_user(user.clone())
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    subscription.notifications_enabled = payload.notifications_enabled;
 
-        Ok(Json(SubscriptionResponse {
-            subscriptions: user.subscriptions.clone(),
-        }))
-    } else {
-        Err(StatusCode::NOT_FOUND)
-    }
+    state
+        .db
+        .update_user(user.clone())
+        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+
+    Ok(Json(SubscriptionResponse {
+        subscriptions: user.subscriptions.clone(),
+    }))
 }

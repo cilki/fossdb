@@ -1,76 +1,92 @@
+//! Sign-in and sign-up dialogs.
+//!
+//! Authentication is a single random account id with no password, no email
+//! and no recovery. That makes registration unusual: the server mints the
+//! credential and discloses it exactly once, so the register dialog is
+//! mostly a hand-off screen whose job is to make sure the user actually
+//! saves it before closing.
+
 use crate::api::ApiClient;
 use crate::hooks::{use_auth, use_notifications};
 use dioxus::prelude::*;
 
-fn is_valid_email(email: &str) -> bool {
-    email.contains('@') && email.contains('.') && email.len() > 5
+/// Copy text to the clipboard, returning whether the call was dispatched.
+///
+/// The async clipboard API is unavailable on insecure origins and in some
+/// embedded webviews, so callers must tolerate failure rather than assume
+/// the copy happened.
+fn copy_to_clipboard(text: &str) -> bool {
+    let Some(window) = web_sys::window() else {
+        return false;
+    };
+
+    let clipboard = window.navigator().clipboard();
+    let _promise = clipboard.write_text(text);
+    true
 }
 
 #[component]
 pub fn LoginModal(show: Signal<bool>) -> Element {
-    let mut email = use_signal(|| String::new());
-    let mut password = use_signal(|| String::new());
-    let mut email_error = use_signal(|| None::<String>);
-    let mut form_error = use_signal(|| None::<String>);
-    let mut email_touched = use_signal(|| false);
+    let mut input = use_signal(String::new);
+    let mut error = use_signal(|| None::<String>);
+    let mut submitting = use_signal(|| false);
     let auth = use_auth();
     let notif = use_notifications();
 
-    let mut validate_email = move || {
-        let email_val = email();
-        if email_touched() {
-            if email_val.is_empty() {
-                email_error.set(Some("Email is required".to_string()));
-            } else if !is_valid_email(&email_val) {
-                email_error.set(Some("Please enter a valid email address".to_string()));
-            } else {
-                email_error.set(None);
-            }
-        }
+    let mut reset = move || {
+        input.set(String::new());
+        error.set(None);
+        submitting.set(false);
     };
 
     let handle_submit = move |evt: Event<FormData>| {
         evt.prevent_default();
 
-        let email_val = email();
-        let password_val = password();
-
-        // Client-side validation
-        if !is_valid_email(&email_val) {
-            email_touched.set(true);
-            if email_val.is_empty() {
-                email_error.set(Some("Email is required".to_string()));
-            } else {
-                email_error.set(Some("Please enter a valid email address".to_string()));
-            }
+        if submitting() {
             return;
         }
 
-        if password_val.is_empty() {
-            form_error.set(Some("Password is required".to_string()));
+        // Normalise before validating so a pasted id with stray whitespace,
+        // case or dashes is accepted rather than rejected on cosmetics.
+        let candidate = fossdb::user_id::normalize(&input());
+
+        if !fossdb::user_id::is_well_formed(&candidate) {
+            error.set(Some(
+                "That does not look like an account ID. They start with \"fdb_\" \
+                 followed by 26 characters."
+                    .to_string(),
+            ));
             return;
         }
 
         let mut auth_copy = auth;
         let mut notif_copy = notif;
+        submitting.set(true);
+        error.set(None);
 
         spawn(async move {
             let client = ApiClient::new();
-            match client.login(email_val, password_val).await {
+            match client.login(candidate.clone()).await {
                 Ok(response) => {
-                    auth_copy.login(response.token, response.user);
-                    notif_copy.success("Logged in successfully".to_string());
+                    auth_copy.login(candidate, response.user);
+                    notif_copy.success("Signed in".to_string());
                     show.set(false);
-                    // Reset form
-                    email.set(String::new());
-                    password.set(String::new());
-                    email_error.set(None);
-                    form_error.set(None);
-                    email_touched.set(false);
+                    reset();
                 }
                 Err(e) => {
-                    let err_msg = e.as_string().unwrap_or_else(|| "Login failed".to_string());
-                    form_error.set(Some(err_msg));
+                    submitting.set(false);
+                    // A 401 here means the id is wrong or the account was
+                    // reaped for having no subscriptions; say both.
+                    let message = e.as_string().unwrap_or_default();
+                    error.set(Some(if message.contains("401") {
+                        "No account with that ID. Check it for typos - and note that \
+                         accounts with no subscriptions are deleted automatically."
+                            .to_string()
+                    } else if message.is_empty() {
+                        "Sign-in failed.".to_string()
+                    } else {
+                        message
+                    }));
                 }
             }
         });
@@ -81,102 +97,57 @@ pub fn LoginModal(show: Signal<bool>) -> Element {
     }
 
     rsx! {
-        div { class: "fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4",
+        div {
+            class: "fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4",
             onclick: move |_| {
                 show.set(false);
-                email.set(String::new());
-                password.set(String::new());
-                email_error.set(None);
-                form_error.set(None);
-                email_touched.set(false);
+                reset();
             },
-            div { class: "bg-gray-800 rounded-2xl w-full max-w-md shadow-2xl border border-gray-700",
+            div {
+                class: "bg-gray-800 rounded-2xl w-full max-w-md shadow-2xl border border-gray-700",
                 onclick: move |evt| evt.stop_propagation(),
                 div { class: "p-8",
-                    h3 { class: "text-2xl font-bold text-gray-100 mb-6 text-center", "Welcome Back" }
+                    h3 { class: "text-2xl font-bold text-gray-100 mb-2 text-center", "Sign in" }
+                    p { class: "text-sm text-gray-400 mb-6 text-center",
+                        "Paste the account ID you were given when you signed up."
+                    }
 
-                    form {
-                        onsubmit: handle_submit,
-
+                    form { onsubmit: handle_submit,
                         div { class: "mb-4",
-                            label { class: "block text-gray-300 font-medium mb-2", "Email" }
+                            label { class: "block text-sm font-medium text-gray-300 mb-2",
+                                "Account ID"
+                            }
                             input {
-                                r#type: "email",
-                                class: if email_error().is_some() {
-                                    "w-full p-3 bg-gray-700 border-2 border-red-500 rounded-lg focus:ring-2 focus:ring-red-400 text-gray-100 placeholder-gray-400"
-                                } else {
-                                    "w-full p-3 bg-gray-700 border border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-400 focus:border-blue-400 text-gray-100 placeholder-gray-400"
-                                },
-                                placeholder: "Enter your email address",
-                                value: "{email}",
+                                class: "w-full px-4 py-3 bg-gray-900 border border-gray-600 rounded-lg text-gray-100 font-mono text-sm focus:outline-none focus:ring-2 focus:ring-blue-500",
+                                r#type: "text",
+                                placeholder: "fdb_...",
+                                autocomplete: "off",
+                                spellcheck: "false",
+                                value: "{input}",
                                 oninput: move |evt| {
-                                    email.set(evt.value());
-                                    if email_touched() {
-                                        validate_email();
-                                    }
-                                    if form_error().is_some() {
-                                        form_error.set(None);
-                                    }
+                                    input.set(evt.value());
+                                    error.set(None);
                                 },
-                                onblur: move |_| {
-                                    email_touched.set(true);
-                                    validate_email();
-                                },
-                                required: true
-                            }
-                            if let Some(err) = email_error() {
-                                div { class: "mt-1 text-sm text-red-400", "{err}" }
                             }
                         }
 
-                        div { class: "mb-6",
-                            label { class: "block text-gray-300 font-medium mb-2", "Password" }
-                            input {
-                                r#type: "password",
-                                class: "w-full p-3 bg-gray-700 border border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-400 focus:border-blue-400 text-gray-100 placeholder-gray-400",
-                                placeholder: "Enter your password",
-                                value: "{password}",
-                                oninput: move |evt| {
-                                    password.set(evt.value());
-                                    if form_error().is_some() {
-                                        form_error.set(None);
-                                    }
-                                },
-                                required: true
+                        if let Some(message) = error() {
+                            div { class: "mb-4 p-3 bg-red-900/30 border border-red-700 rounded-lg",
+                                p { class: "text-sm text-red-300", "{message}" }
                             }
                         }
 
-                        if let Some(err) = form_error() {
-                            div { class: "mb-4 p-3 bg-red-500/10 border border-red-500/20 rounded-lg animate-shake",
-                                div { class: "flex items-center space-x-3",
-                                    svg { class: "w-5 h-5 text-red-400 flex-shrink-0", fill: "none", stroke: "currentColor", view_box: "0 0 24 24",
-                                        path { stroke_linecap: "round", stroke_linejoin: "round", stroke_width: "2", d: "M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" }
-                                    }
-                                    div { class: "text-sm text-red-300", "{err}" }
-                                }
-                            }
+                        button {
+                            class: "w-full py-3 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold rounded-lg transition",
+                            r#type: "submit",
+                            disabled: submitting(),
+                            if submitting() { "Signing in..." } else { "Sign in" }
                         }
+                    }
 
-                        div { class: "flex gap-3",
-                            button {
-                                r#type: "submit",
-                                class: "flex-1 bg-gradient-to-r from-blue-500 to-purple-600 text-white p-3 rounded-lg font-medium hover:from-blue-600 hover:to-purple-700 transition-all",
-                                "Login"
-                            }
-                            button {
-                                r#type: "button",
-                                class: "flex-1 bg-gray-600 text-gray-200 p-3 rounded-lg font-medium hover:bg-gray-500 transition-all",
-                                onclick: move |_| {
-                                    show.set(false);
-                                    email.set(String::new());
-                                    password.set(String::new());
-                                    email_error.set(None);
-                                    form_error.set(None);
-                                    email_touched.set(false);
-                                },
-                                "Cancel"
-                            }
-                        }
+                    p { class: "mt-6 text-xs text-gray-500 text-center",
+                        "Your account ID is also your password. There is no email address \
+                         and no way to recover it."
                     }
                 }
             }
@@ -186,113 +157,79 @@ pub fn LoginModal(show: Signal<bool>) -> Element {
 
 #[component]
 pub fn RegisterModal(show: Signal<bool>) -> Element {
-    let mut username = use_signal(|| String::new());
-    let mut email = use_signal(|| String::new());
-    let mut password = use_signal(|| String::new());
-    let mut username_error = use_signal(|| None::<String>);
-    let mut email_error = use_signal(|| None::<String>);
-    let mut password_error = use_signal(|| None::<String>);
-    let mut form_error = use_signal(|| None::<String>);
-    let mut username_touched = use_signal(|| false);
-    let mut email_touched = use_signal(|| false);
-    let mut password_touched = use_signal(|| false);
+    // `Some` once the server has minted an id: the dialog switches from a
+    // confirmation prompt to a hand-off screen.
+    let mut issued = use_signal(|| None::<fossdb::RegisterResponse>);
+    let mut error = use_signal(|| None::<String>);
+    let mut submitting = use_signal(|| false);
+    let mut acknowledged = use_signal(|| false);
+    let mut copied = use_signal(|| false);
+
     let auth = use_auth();
     let notif = use_notifications();
 
-    let mut validate_username = move || {
-        let username_val = username();
-        if username_touched() {
-            if username_val.is_empty() {
-                username_error.set(Some("Username is required".to_string()));
-            } else if username_val.len() < 3 {
-                username_error.set(Some("Username must be at least 3 characters".to_string()));
-            } else {
-                username_error.set(None);
-            }
-        }
+    let mut reset = move || {
+        issued.set(None);
+        error.set(None);
+        submitting.set(false);
+        acknowledged.set(false);
+        copied.set(false);
     };
 
-    let mut validate_email_fn = move || {
-        let email_val = email();
-        if email_touched() {
-            if email_val.is_empty() {
-                email_error.set(Some("Email is required".to_string()));
-            } else if !is_valid_email(&email_val) {
-                email_error.set(Some("Please enter a valid email address".to_string()));
-            } else {
-                email_error.set(None);
-            }
-        }
-    };
-
-    let mut validate_password = move || {
-        let password_val = password();
-        if password_touched() {
-            if password_val.is_empty() {
-                password_error.set(Some("Password is required".to_string()));
-            } else if password_val.len() < 6 {
-                password_error.set(Some("Password must be at least 6 characters".to_string()));
-            } else {
-                password_error.set(None);
-            }
-        }
-    };
-
-    let handle_submit = move |evt: Event<FormData>| {
-        evt.prevent_default();
-
-        let username_val = username();
-        let email_val = email();
-        let password_val = password();
-
-        // Mark all as touched and validate
-        username_touched.set(true);
-        email_touched.set(true);
-        password_touched.set(true);
-
-        // Manual validation for submit
-        if username_val.is_empty() || username_val.len() < 3 {
-            username_error.set(Some("Username must be at least 3 characters".to_string()));
+    let create = move |_| {
+        if submitting() {
             return;
         }
-        if email_val.is_empty() || !is_valid_email(&email_val) {
-            email_error.set(Some("Please enter a valid email address".to_string()));
-            return;
-        }
-        if password_val.is_empty() || password_val.len() < 6 {
-            password_error.set(Some("Password must be at least 6 characters".to_string()));
-            return;
-        }
-
-        let mut auth_copy = auth;
-        let mut notif_copy = notif;
+        submitting.set(true);
+        error.set(None);
 
         spawn(async move {
             let client = ApiClient::new();
-            match client.register(username_val, email_val, password_val).await {
+            match client.register().await {
                 Ok(response) => {
-                    auth_copy.login(response.token, response.user);
-                    notif_copy.success("Account created successfully".to_string());
-                    show.set(false);
-                    // Reset form
-                    username.set(String::new());
-                    email.set(String::new());
-                    password.set(String::new());
-                    username_error.set(None);
-                    email_error.set(None);
-                    password_error.set(None);
-                    form_error.set(None);
-                    username_touched.set(false);
-                    email_touched.set(false);
-                    password_touched.set(false);
+                    submitting.set(false);
+                    issued.set(Some(response));
                 }
                 Err(e) => {
-                    let err_msg = e
-                        .as_string()
-                        .unwrap_or_else(|| "Registration failed".to_string());
-                    form_error.set(Some(err_msg));
+                    submitting.set(false);
+                    error.set(Some(
+                        e.as_string()
+                            .unwrap_or_else(|| "Could not create an account.".to_string()),
+                    ));
                 }
             }
+        });
+    };
+
+    // Only runs once the user has ticked the acknowledgement, so we never
+    // close the one screen that shows the credential without consent.
+    let finish = move |_| {
+        let Some(registered) = issued() else {
+            return;
+        };
+
+        let mut auth_copy = auth;
+        let mut notif_copy = notif;
+        let user_id = registered.user_id.clone();
+
+        spawn(async move {
+            let client = ApiClient::new();
+
+            // Fetch the account view so the UI has the same shape it would
+            // after a normal sign-in.
+            let user = match client.login(user_id.clone()).await {
+                Ok(response) => response.user,
+                Err(_) => fossdb::UserResponse {
+                    created_at: registered.created_at.to_rfc3339(),
+                    subscription_count: 0,
+                    notifications_enabled: true,
+                },
+            };
+
+            auth_copy.login(user_id, user);
+            notif_copy.success("Account created".to_string());
+            show.set(false);
+            reset();
         });
     };
 
@@ -301,158 +238,111 @@ pub fn RegisterModal(show: Signal<bool>) -> Element {
     }
 
     rsx! {
-        div { class: "fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4",
+        div {
+            class: "fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center z-50 p-4",
+            // Deliberately no click-outside dismissal once an id has been
+            // issued: closing here would lose the credential for good.
             onclick: move |_| {
-                show.set(false);
-                username.set(String::new());
-                email.set(String::new());
-                password.set(String::new());
-                username_error.set(None);
-                email_error.set(None);
-                password_error.set(None);
-                form_error.set(None);
-                username_touched.set(false);
-                email_touched.set(false);
-                password_touched.set(false);
+                if issued().is_none() {
+                    show.set(false);
+                    reset();
+                }
             },
-            div { class: "bg-gray-800 rounded-2xl w-full max-w-md shadow-2xl border border-gray-700",
+            div {
+                class: "bg-gray-800 rounded-2xl w-full max-w-lg shadow-2xl border border-gray-700",
                 onclick: move |evt| evt.stop_propagation(),
                 div { class: "p-8",
-                    h3 { class: "text-2xl font-bold text-gray-100 mb-6 text-center", "Join FossDB" }
 
-                    form {
-                        onsubmit: handle_submit,
+                    if let Some(registered) = issued() {
+                        h3 { class: "text-2xl font-bold text-gray-100 mb-2 text-center",
+                            "Save your account ID"
+                        }
+                        p { class: "text-sm text-gray-400 mb-6 text-center",
+                            "This is the only time it will be shown."
+                        }
 
-                        div { class: "mb-4",
-                            label { class: "block text-gray-300 font-medium mb-2", "Username" }
-                            input {
-                                r#type: "text",
-                                class: if username_error().is_some() {
-                                    "w-full p-3 bg-gray-700 border-2 border-red-500 rounded-lg focus:ring-2 focus:ring-red-400 text-gray-100 placeholder-gray-400"
-                                } else {
-                                    "w-full p-3 bg-gray-700 border border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-400 focus:border-blue-400 text-gray-100 placeholder-gray-400"
-                                },
-                                placeholder: "Choose a username (min. 3 characters)",
-                                value: "{username}",
-                                oninput: move |evt| {
-                                    username.set(evt.value());
-                                    if username_touched() {
-                                        validate_username();
-                                    }
-                                    if form_error().is_some() {
-                                        form_error.set(None);
-                                    }
-                                },
-                                onblur: move |_| {
-                                    username_touched.set(true);
-                                    validate_username();
-                                },
-                                minlength: 3,
-                                required: true
-                            }
-                            if let Some(err) = username_error() {
-                                div { class: "mt-1 text-sm text-red-400", "{err}" }
+                        div { class: "mb-4 p-4 bg-gray-900 border border-gray-600 rounded-lg",
+                            code { class: "block text-center text-lg text-blue-300 font-mono break-all select-all",
+                                "{registered.user_id}"
                             }
                         }
 
-                        div { class: "mb-4",
-                            label { class: "block text-gray-300 font-medium mb-2", "Email" }
-                            input {
-                                r#type: "email",
-                                class: if email_error().is_some() {
-                                    "w-full p-3 bg-gray-700 border-2 border-red-500 rounded-lg focus:ring-2 focus:ring-red-400 text-gray-100 placeholder-gray-400"
-                                } else {
-                                    "w-full p-3 bg-gray-700 border border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-400 focus:border-blue-400 text-gray-100 placeholder-gray-400"
-                                },
-                                placeholder: "Enter your email address",
-                                value: "{email}",
-                                oninput: move |evt| {
-                                    email.set(evt.value());
-                                    if email_touched() {
-                                        validate_email_fn();
+                        button {
+                            class: "w-full mb-5 py-2 bg-gray-700 hover:bg-gray-600 text-gray-200 text-sm font-medium rounded-lg transition",
+                            r#type: "button",
+                            onclick: move |_| {
+                                if let Some(r) = issued() {
+                                    if copy_to_clipboard(&r.user_id) {
+                                        copied.set(true);
                                     }
-                                    if form_error().is_some() {
-                                        form_error.set(None);
-                                    }
-                                },
-                                onblur: move |_| {
-                                    email_touched.set(true);
-                                    validate_email_fn();
-                                },
-                                required: true
-                            }
-                            if let Some(err) = email_error() {
-                                div { class: "mt-1 text-sm text-red-400", "{err}" }
-                            }
-                        }
-
-                        div { class: "mb-6",
-                            label { class: "block text-gray-300 font-medium mb-2", "Password" }
-                            input {
-                                r#type: "password",
-                                class: if password_error().is_some() {
-                                    "w-full p-3 bg-gray-700 border-2 border-red-500 rounded-lg focus:ring-2 focus:ring-red-400 text-gray-100 placeholder-gray-400"
-                                } else {
-                                    "w-full p-3 bg-gray-700 border border-gray-600 rounded-lg focus:ring-2 focus:ring-blue-400 focus:border-blue-400 text-gray-100 placeholder-gray-400"
-                                },
-                                placeholder: "Create a password (min. 6 characters)",
-                                value: "{password}",
-                                oninput: move |evt| {
-                                    password.set(evt.value());
-                                    if password_touched() {
-                                        validate_password();
-                                    }
-                                    if form_error().is_some() {
-                                        form_error.set(None);
-                                    }
-                                },
-                                onblur: move |_| {
-                                    password_touched.set(true);
-                                    validate_password();
-                                },
-                                minlength: 6,
-                                required: true
-                            }
-                            if let Some(err) = password_error() {
-                                div { class: "mt-1 text-sm text-red-400", "{err}" }
-                            }
-                        }
-
-                        if let Some(err) = form_error() {
-                            div { class: "mb-4 p-3 bg-red-500/10 border border-red-500/20 rounded-lg animate-shake",
-                                div { class: "flex items-center space-x-3",
-                                    svg { class: "w-5 h-5 text-red-400 flex-shrink-0", fill: "none", stroke: "currentColor", view_box: "0 0 24 24",
-                                        path { stroke_linecap: "round", stroke_linejoin: "round", stroke_width: "2", d: "M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" }
-                                    }
-                                    div { class: "text-sm text-red-300", "{err}" }
                                 }
+                            },
+                            if copied() { "Copied" } else { "Copy to clipboard" }
+                        }
+
+                        div { class: "mb-5 p-4 bg-amber-900/30 border border-amber-700 rounded-lg",
+                            p { class: "text-sm text-amber-200 font-semibold mb-2",
+                                "There is no account recovery."
+                            }
+                            ul { class: "text-xs text-amber-200/90 space-y-1 list-disc list-inside",
+                                li { "This ID is your username and your password combined." }
+                                li { "We hold no email address, so it cannot be reset." }
+                                li { "It also appears in your feed URLs - anyone with one of
+                                      those URLs can use your account." }
+                                li { "Accounts with no subscriptions are deleted automatically,
+                                      so subscribe to something to keep this one." }
                             }
                         }
 
-                        div { class: "flex gap-3",
-                            button {
-                                r#type: "submit",
-                                class: "flex-1 bg-gradient-to-r from-green-500 to-emerald-600 text-white p-3 rounded-lg font-medium hover:from-green-600 hover:to-emerald-700 transition-all",
-                                "Register"
+                        label { class: "flex items-start gap-3 mb-5 cursor-pointer",
+                            input {
+                                class: "mt-1",
+                                r#type: "checkbox",
+                                checked: acknowledged(),
+                                onchange: move |evt| acknowledged.set(evt.checked()),
                             }
-                            button {
-                                r#type: "button",
-                                class: "flex-1 bg-gray-600 text-gray-200 p-3 rounded-lg font-medium hover:bg-gray-500 transition-all",
-                                onclick: move |_| {
-                                    show.set(false);
-                                    username.set(String::new());
-                                    email.set(String::new());
-                                    password.set(String::new());
-                                    username_error.set(None);
-                                    email_error.set(None);
-                                    password_error.set(None);
-                                    form_error.set(None);
-                                    username_touched.set(false);
-                                    email_touched.set(false);
-                                    password_touched.set(false);
-                                },
-                                "Cancel"
+                            span { class: "text-sm text-gray-300",
+                                "I have saved my account ID somewhere safe."
                             }
+                        }
+
+                        button {
+                            class: "w-full py-3 bg-blue-600 hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed text-white font-semibold rounded-lg transition",
+                            r#type: "button",
+                            disabled: !acknowledged(),
+                            onclick: finish,
+                            "Continue"
+                        }
+                    } else {
+                        h3 { class: "text-2xl font-bold text-gray-100 mb-2 text-center",
+                            "Create an account"
+                        }
+                        p { class: "text-sm text-gray-400 mb-6 text-center",
+                            "No email address and no password. We generate a single random \
+                             ID that is your entire account."
+                        }
+
+                        div { class: "mb-6 p-4 bg-gray-900/60 border border-gray-700 rounded-lg",
+                            ul { class: "text-xs text-gray-400 space-y-1 list-disc list-inside",
+                                li { "You will be shown your ID once, and only once." }
+                                li { "Store it like a password - it cannot be recovered." }
+                                li { "Subscribe to at least one package, or the account is
+                                      deleted automatically." }
+                            }
+                        }
+
+                        if let Some(message) = error() {
+                            div { class: "mb-4 p-3 bg-red-900/30 border border-red-700 rounded-lg",
+                                p { class: "text-sm text-red-300", "{message}" }
+                            }
+                        }
+
+                        button {
+                            class: "w-full py-3 bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white font-semibold rounded-lg transition",
+                            r#type: "button",
+                            disabled: submitting(),
+                            onclick: create,
+                            if submitting() { "Creating..." } else { "Create account" }
                         }
                     }
                 }

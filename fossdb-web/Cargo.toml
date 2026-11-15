@@ -35,4 +35,7 @@ web-sys = { version = "0.3", features = [
   "RequestMode",
   "Response",
   "Headers",
+  # Clipboard access for the "copy your account ID" button.
+  "Navigator",
+  "Clipboard",
 ] }

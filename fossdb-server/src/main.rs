@@ -17,14 +17,11 @@ use tracing::{error, info};
 use fossdb_server::{AppState, config::Config, db::Database, handlers, middleware};
 use fossdb_server::{Package, PackageVersion, User, Vulnerability, TimelineEvent};
 
-#[cfg(feature = "email")]
-use fossdb_server::{email, notifications};
-
 use fossdb_server::websocket;
 
-/// FossDB - Free Software Database
+/// FossDB - Free Software Database server
 #[derive(Parser, Debug)]
-#[command(name = "fossdb")]
+#[command(name = "fossdb-server")]
 #[command(version, about, long_about = None)]
 struct Args {
     #[command(subcommand)]
@@ -77,6 +74,9 @@ async fn main() -> Result<()> {
 
 async fn start_server(config: Config) -> Result<()> {
     let db = Database::new(&config.database_path)?;
+    // Refuse to start on a pre-rewrite database rather than failing later
+    // with an opaque decode error from inside a request handler.
+    db.preflight()?;
     let db = Arc::new(db);
 
     let num_packages = db.get_all_packages()?.len();
@@ -103,34 +103,51 @@ async fn start_server(config: Config) -> Result<()> {
     let state = AppState {
         db: db.clone(),
         broadcaster: broadcaster.clone(),
-        collector_api_key: config.collector_api_key.clone(),
-        worker_api_key: config.worker_api_key.clone(),
+        key_activity: std::sync::Arc::new(std::sync::Mutex::new(
+            fossdb_server::key_activity::KeyActivity::new(),
+        )),
         claimed_versions: std::sync::Arc::new(std::sync::Mutex::new(
             fossdb_server::claims::ClaimSet::new(),
         )),
+        public_base_url: config.public_base_url.clone(),
+        started_at: chrono::Utc::now(),
     };
 
-    // Email notifications
-    #[cfg(feature = "email")]
-    if config.email_enabled {
-        info!("Starting notification processor...");
-        let email_service = Arc::new(
-            email::EmailService::new(config.clone())
-                .expect("Failed to initialize email service"),
-        );
-        let processor = notifications::NotificationProcessor::new(db.clone(), email_service);
+    // Unsubscribed-account reaper.
+    //
+    // An account that never subscribes to anything is indistinguishable from
+    // signup noise: it produces no events and no feed. Reaping it after a
+    // grace period keeps the table proportional to real usage, which matters
+    // because registration is unauthenticated and unthrottled.
+    let reaper_db = db.clone();
+    let grace = chrono::Duration::hours(config.account_grace_hours as i64);
+    let purge_interval = config.account_purge_interval_secs;
+    info!(
+        "Account reaper: purging subscription-less accounts older than {}h every {}s",
+        config.account_grace_hours, purge_interval
+    );
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(purge_interval)).await;
+            match reaper_db.purge_unsubscribed_users(grace) {
+                Ok(0) => {}
+                Ok(count) => info!("Purged {} account(s) with no subscriptions", count),
+                Err(e) => error!("Failed to purge unsubscribed accounts: {}", e),
+            }
+        }
+    });
+
+    // Admin control socket. Unix-only, and optional: a failure to bind is
+    // logged but must not take the API server down with it.
+    #[cfg(unix)]
+    {
+        let admin_state = state.clone();
+        let socket_path = config.admin_socket_path.clone();
         tokio::spawn(async move {
-            loop {
-                if let Err(e) = processor.process_new_releases().await {
-                    error!("Notification processing error: {}", e);
-                }
-                tokio::time::sleep(tokio::time::Duration::from_secs(5 * 60)).await;
+            if let Err(e) = fossdb_server::admin::serve(admin_state, &socket_path).await {
+                error!("Admin socket unavailable at {}: {:#}", socket_path, e);
             }
         });
-    }
-    #[cfg(feature = "email")]
-    if !config.email_enabled {
-        info!("Email disabled, notification processor not started");
     }
 
     // Timeline event purge task
@@ -208,12 +225,18 @@ async fn start_server(config: Config) -> Result<()> {
         )
         .route("/api/users/settings/notifications", get(handlers::users::get_notification_settings))
         .route("/api/users/settings/notifications", put(handlers::users::update_notification_settings))
-        .layer(axum::middleware::from_fn(middleware::auth_middleware))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::auth_middleware,
+        ))
         .with_state(state.clone());
 
     let timeline_route = Router::new()
         .route("/api/users/timeline", get(handlers::users::get_timeline))
-        .layer(axum::middleware::from_fn(middleware::optional_auth_middleware))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            middleware::optional_auth_middleware,
+        ))
         .with_state(state.clone());
 
     let app = Router::new()
@@ -224,20 +247,24 @@ async fn start_server(config: Config) -> Result<()> {
         .route("/api/packages/{id}/versions", get(handlers::packages::get_package_versions))
         .route("/api/packages/{id}/subscribers", get(handlers::packages::get_package_subscriber_count))
         .route("/api/auth/register", post(handlers::auth::register))
-        .route("/api/auth/register-form", post(handlers::auth::register_form))
         .route("/api/auth/login", post(handlers::auth::login))
-        .route("/api/auth/login-form", post(handlers::auth::login_form))
         .route("/api/analytics", get(handlers::analytics::get_analytics))
         .route("/api/analytics/languages", get(handlers::analytics::get_language_trends))
         .route("/api/analytics/security", get(handlers::analytics::get_security_report))
         .route("/ws/timeline", get(websocket::timeline_websocket_handler))
+        // Feeds authenticate by path: the id in the URL is the credential, so
+        // these must stay off the bearer-auth router.
+        .route("/feed/{user_id}/atom.xml", get(handlers::feed::atom))
+        .route("/feed/{user_id}/rss.xml", get(handlers::feed::rss))
         .merge(timeline_route)
         .merge(protected)
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await?;
-    info!("Server running on http://0.0.0.0:3000");
+    let bind = format!("0.0.0.0:{}", config.server_port);
+    let listener = tokio::net::TcpListener::bind(&bind).await?;
+    info!("Server running on http://{}", bind);
+    info!("Public base URL for feed links: {}", config.public_base_url);
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -279,7 +306,17 @@ async fn export_database(config: &Config, output_dir: PathBuf, table: Option<Str
         match table_name.as_str() {
             "packages" => export_table("packages", db.get_all_packages()?, &output_path)?,
             "versions" => export_table("versions", db.get_all_versions()?, &output_path)?,
-            "users" => export_table("users", db.get_all_users()?, &output_path)?,
+            "users" => {
+                // The user table now stores live credentials in the clear -
+                // the id *is* the password. An export is therefore a file
+                // that grants access to every account in it.
+                eprintln!(
+                    "WARNING: users.json will contain every account's login credential \
+                     in plaintext.\n         Treat it as a secret: anyone who reads it \
+                     can sign in as any of those accounts."
+                );
+                export_table("users", db.get_all_users()?, &output_path)?
+            }
             "vulnerabilities" => export_table("vulnerabilities", db.get_all_vulnerabilities()?, &output_path)?,
             "timeline_events" => export_table("timeline events", db.get_all_timeline_events()?, &output_path)?,
             _ => {
@@ -342,9 +379,37 @@ async fn import_database(config: &Config, input: PathBuf, merge: bool) -> Result
             let data: Vec<PackageVersion> = serde_json::from_str(&json)?;
             import_with_progress!(data, "versions", get_version, insert_version);
         }
+        // Users are keyed by their credential rather than a numeric id, and
+        // `insert_user` reports a key collision as `Ok(None)` instead of
+        // erroring, so this cannot use the macro above.
         "users" => {
             let data: Vec<User> = serde_json::from_str(&json)?;
-            import_with_progress!(data, "users", get_user, insert_user);
+            eprintln!("Found {} users to import", data.len());
+
+            if !merge {
+                eprintln!("WARNING: This will replace existing users!");
+                eprintln!("Press Ctrl+C within 5 seconds to cancel...");
+                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+            }
+
+            let total = data.len();
+            let mut skipped = 0;
+            for (idx, item) in data.into_iter().enumerate() {
+                if merge && db.get_user(&item.user_id)?.is_some() {
+                    skipped += 1;
+                    continue;
+                }
+                if db.insert_user(item)?.is_none() {
+                    skipped += 1;
+                }
+
+                if (idx + 1) % 100 == 0 || idx + 1 == total {
+                    eprint!("\rImporting users: {}/{}", idx + 1, total);
+                    use std::io::Write;
+                    std::io::stderr().flush()?;
+                }
+            }
+            eprintln!("\n✓ Imported {} users ({} skipped)", total - skipped, skipped);
         }
         "vulnerabilities" => {
             let data: Vec<Vulnerability> = serde_json::from_str(&json)?;

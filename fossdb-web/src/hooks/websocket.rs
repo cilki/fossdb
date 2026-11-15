@@ -1,5 +1,5 @@
 use dioxus::prelude::*;
-use futures::StreamExt;
+use futures::{SinkExt, StreamExt};
 use gloo_net::websocket::{Message, futures::WebSocket};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -36,7 +36,19 @@ pub fn websocket_url(path: &str) -> Option<String> {
 /// Returns a signal describing the connection state so callers can surface it;
 /// the previous signature returned `()`, leaving the state signal unobservable
 /// dead weight.
-pub fn use_websocket<T, F>(url: String, on_message: F) -> Signal<WebSocketState>
+/// Maintain a WebSocket connection, optionally authenticating it.
+///
+/// `credential` is the account id. When present it is sent as an in-band
+/// `Auth` frame immediately after the socket opens, which is the only way to
+/// authenticate a browser WebSocket - the handshake cannot carry an
+/// `Authorization` header. Until this frame is sent the server treats the
+/// connection as anonymous and delivers only global events, so personal
+/// timeline updates never arrive.
+pub fn use_websocket<T, F>(
+    url: String,
+    credential: Option<String>,
+    on_message: F,
+) -> Signal<WebSocketState>
 where
     T: for<'de> serde::Deserialize<'de> + 'static,
     F: FnMut(T) + 'static,
@@ -51,7 +63,9 @@ where
     // `use_reactive` makes the connection task restart when `url` changes.
     // Previously the task captured the URL from the first render and a changed
     // URL never triggered a reconnect.
-    use_effect(use_reactive!(|url| {
+    // Reconnect when either the URL or the credential changes, so signing in
+    // or out rebinds the socket instead of leaving it on the old identity.
+    use_effect(use_reactive!(|(url, credential)| {
         let on_message = on_message.clone();
 
         spawn(async move {
@@ -71,6 +85,25 @@ where
                         });
                         // Successful connection resets the backoff.
                         delay = RECONNECT_BASE_DELAY_SECS;
+
+                        // Authenticate before reading, so no personal event
+                        // can be missed in the gap.
+                        if let Some(user_id) = credential.clone() {
+                            let auth = fossdb::WebSocketMessage::Auth { user_id };
+                            match serde_json::to_string(&auth) {
+                                Ok(frame) => {
+                                    if ws.send(Message::Text(frame)).await.is_err() {
+                                        gloo_console::warn!(
+                                            "WebSocket closed before authentication"
+                                        );
+                                        // Fall through to the reconnect path.
+                                    }
+                                }
+                                Err(e) => gloo_console::warn!(format!(
+                                    "Could not serialise websocket auth frame: {e}"
+                                )),
+                            }
+                        }
 
                         while let Some(msg) = ws.next().await {
                             match msg {

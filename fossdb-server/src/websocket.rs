@@ -3,7 +3,6 @@ use axum::{
     response::Response,
 };
 use futures::{SinkExt, StreamExt};
-use std::sync::Arc;
 use tokio::sync::broadcast;
 
 /// Broadcaster for timeline events
@@ -35,18 +34,20 @@ pub async fn timeline_websocket_handler(
     ws: WebSocketUpgrade,
     State(state): State<crate::AppState>,
 ) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, state.broadcaster))
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-async fn handle_socket(socket: WebSocket, broadcaster: Arc<TimelineBroadcaster>) {
+async fn handle_socket(socket: WebSocket, state: crate::AppState) {
     tracing::debug!("New WebSocket connection established");
     let (mut sender, mut receiver) = socket.split();
-    let mut rx = broadcaster.subscribe();
-    let mut user_id: Option<u64> = None;
+    let mut rx = state.broadcaster.subscribe();
+    let mut user_id: Option<String> = None;
 
     // Use channels to communicate from receiver to sender
-    let (auth_tx, mut auth_rx) = tokio::sync::mpsc::channel::<u64>(1);
+    let (auth_tx, mut auth_rx) = tokio::sync::mpsc::channel::<String>(1);
     let (ping_tx, mut ping_rx) = tokio::sync::mpsc::channel::<()>(1);
+
+    let auth_db = state.db.clone();
 
     // Spawn a task to receive messages from the client
     let mut recv_task = tokio::spawn(async move {
@@ -55,12 +56,29 @@ async fn handle_socket(socket: WebSocket, broadcaster: Arc<TimelineBroadcaster>)
                 && let Ok(ws_msg) = serde_json::from_str::<crate::WebSocketMessage>(&text)
             {
                 match ws_msg {
-                    crate::WebSocketMessage::Auth { token } => {
-                        // Verify JWT and extract user_id
-                        if let Ok(claims) = crate::auth::verify_jwt(&token)
-                            && let Ok(uid) = claims.sub.parse::<u64>()
-                        {
-                            let _ = auth_tx.send(uid).await;
+                    crate::WebSocketMessage::Auth { user_id } => {
+                        // The credential arrives in-band here rather than in a
+                        // header, because browsers cannot set headers on a
+                        // WebSocket handshake.
+                        let candidate = fossdb::user_id::normalize(&user_id);
+
+                        // Shape-check before hitting storage, so a socket
+                        // spamming junk cannot be turned into database load.
+                        if !fossdb::user_id::is_well_formed(&candidate) {
+                            tracing::debug!("WebSocket auth rejected: malformed id");
+                            continue;
+                        }
+
+                        match auth_db.get_user(&candidate) {
+                            Ok(Some(_)) => {
+                                let _ = auth_tx.send(candidate).await;
+                            }
+                            Ok(None) => {
+                                tracing::debug!("WebSocket auth rejected: unknown account");
+                            }
+                            Err(e) => {
+                                tracing::error!("WebSocket auth lookup failed: {e}");
+                            }
                         }
                     }
                     crate::WebSocketMessage::Ping => {
@@ -100,9 +118,9 @@ async fn handle_socket(socket: WebSocket, broadcaster: Arc<TimelineBroadcaster>)
                     // Filter events based on authentication:
                     // - If not authenticated: only send global events (user_id = None)
                     // - If authenticated: only send events for this user
-                    let should_send = match (user_id, db_event.user_id) {
+                    let should_send = match (user_id.as_deref(), db_event.user_id.as_deref()) {
                         (None, None) => true,  // Not authenticated, global event
-                        (Some(uid), Some(event_uid)) if uid == event_uid => true,  // Authenticated, personal event
+                        (Some(uid), Some(event_uid)) => uid == event_uid,  // Authenticated, personal event
                         _ => false,  // Don't send
                     };
 
@@ -117,10 +135,13 @@ async fn handle_socket(socket: WebSocket, broadcaster: Arc<TimelineBroadcaster>)
 
                 // Handle client authentication
                 Some(uid) = auth_rx.recv() => {
+                    tracing::debug!(
+                        "WebSocket authenticated account {}",
+                        fossdb::user_id::redact(&uid)
+                    );
                     user_id = Some(uid);
-                    tracing::debug!("WebSocket authenticated user: {}", uid);
-                    // Note: WebSocketMessage doesn't have an Authenticated variant,
-                    // so we don't send a response. Client knows auth succeeded when they get personal events.
+                    // There is no `Authenticated` reply variant; the client
+                    // infers success from receiving personal events.
                 }
 
                 // Respond to client ping

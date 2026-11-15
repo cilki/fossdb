@@ -1,76 +1,70 @@
 use std::env;
 
+/// Server configuration.
+///
+/// Note there are no collector or worker API keys here. Those live in the
+/// database and are minted and revoked through the admin socket with
+/// `fossdb admin api-key`, so that revocation is effective and so the server
+/// no longer refuses to start when a shared secret is absent.
 #[derive(Debug, Clone)]
 pub struct Config {
     pub database_path: String,
-    pub jwt_secret: String,
-    #[allow(dead_code)]
     pub server_port: u16,
     pub libraries_io_api_key: Option<String>,
     pub collector_interval_hours: u64,
     pub timeline_retention_days: u64,
-    pub smtp_host: String,
-    pub smtp_port: u16,
-    pub smtp_username: String,
-    pub smtp_password: String,
-    pub smtp_from_address: String,
-    pub smtp_from_name: String,
-    pub email_enabled: bool,
     pub collector_port: u16,
-    pub collector_api_key: String,
     pub worker_port: u16,
-    pub worker_api_key: String,
+    /// Absolute origin used to build feed links. Feed readers need absolute
+    /// URLs, and the server cannot reliably infer its own public origin from
+    /// a request when it sits behind a proxy.
+    pub public_base_url: String,
+    /// Grace period before an account that has never subscribed to anything
+    /// is reaped.
+    pub account_grace_hours: u64,
+    /// How often the account reaper runs.
+    pub account_purge_interval_secs: u64,
+    /// Filesystem path for the admin control socket. Access to the admin API
+    /// is governed entirely by this socket's permissions.
+    pub admin_socket_path: String,
 }
 
 impl Config {
     pub fn from_env() -> Self {
-        // Require JWT_SECRET to be set - no insecure defaults
-        let jwt_secret = env::var("JWT_SECRET").expect(
-            "JWT_SECRET environment variable must be set. Generate a secure random string.",
-        );
-
         Self {
             database_path: env::var("DATABASE_PATH").unwrap_or_else(|_| "./foss.db".to_string()),
-            jwt_secret,
-            server_port: env::var("SERVER_PORT")
-                .unwrap_or_else(|_| "3000".to_string())
-                .parse()
-                .unwrap_or(3000),
+            server_port: parse_or("SERVER_PORT", 3000),
             libraries_io_api_key: env::var("LIBRARIES_IO_API_KEY").ok(),
-            collector_interval_hours: env::var("COLLECTOR_INTERVAL_HOURS")
-                .unwrap_or_else(|_| "1".to_string())
-                .parse()
-                .unwrap_or(1),
-            timeline_retention_days: env::var("TIMELINE_RETENTION_DAYS")
-                .unwrap_or_else(|_| "90".to_string())
-                .parse()
-                .unwrap_or(90),
-            smtp_host: env::var("SMTP_HOST").unwrap_or_else(|_| "localhost".to_string()),
-            smtp_port: env::var("SMTP_PORT")
-                .unwrap_or_else(|_| "587".to_string())
-                .parse()
-                .unwrap_or(587),
-            smtp_username: env::var("SMTP_USERNAME").unwrap_or_default(),
-            smtp_password: env::var("SMTP_PASSWORD").unwrap_or_default(),
-            smtp_from_address: env::var("SMTP_FROM_ADDRESS")
-                .unwrap_or_else(|_| "noreply@fossdb.org".to_string()),
-            smtp_from_name: env::var("SMTP_FROM_NAME").unwrap_or_else(|_| "FossDB".to_string()),
-            email_enabled: env::var("EMAIL_ENABLED")
-                .unwrap_or_else(|_| "false".to_string())
-                .parse()
-                .unwrap_or(false),
-            collector_port: env::var("COLLECTOR_PORT")
-                .unwrap_or_else(|_| "3001".to_string())
-                .parse()
-                .unwrap_or(3001),
-            collector_api_key: env::var("COLLECTOR_API_KEY")
-                .expect("COLLECTOR_API_KEY environment variable must be set"),
-            worker_port: env::var("WORKER_PORT")
-                .unwrap_or_else(|_| "3002".to_string())
-                .parse()
-                .unwrap_or(3002),
-            worker_api_key: env::var("WORKER_API_KEY")
-                .expect("WORKER_API_KEY environment variable must be set"),
+            collector_interval_hours: parse_or("COLLECTOR_INTERVAL_HOURS", 1),
+            timeline_retention_days: parse_or("TIMELINE_RETENTION_DAYS", 90),
+            collector_port: parse_or("COLLECTOR_PORT", 3001),
+            worker_port: parse_or("WORKER_PORT", 3002),
+            public_base_url: env::var("PUBLIC_BASE_URL")
+                .unwrap_or_else(|_| "http://localhost:3000".to_string())
+                .trim_end_matches('/')
+                .to_string(),
+            account_grace_hours: parse_or("ACCOUNT_GRACE_HOURS", 4),
+            account_purge_interval_secs: parse_or("ACCOUNT_PURGE_INTERVAL_SECS", 300),
+            admin_socket_path: env::var("ADMIN_SOCKET_PATH")
+                .unwrap_or_else(|_| "/run/fossdb/admin.sock".to_string()),
         }
+    }
+}
+
+/// Read a numeric env var, falling back to `default`.
+///
+/// A malformed value falls back rather than failing, matching the previous
+/// behaviour, but it is logged - silently running on a different port than
+/// the operator configured is the kind of thing that wastes an afternoon.
+fn parse_or<T>(key: &str, default: T) -> T
+where
+    T: std::str::FromStr + std::fmt::Display + Copy,
+{
+    match env::var(key) {
+        Err(_) => default,
+        Ok(raw) => raw.parse().unwrap_or_else(|_| {
+            eprintln!("warning: {key}={raw:?} is not a valid value; using {default}");
+            default
+        }),
     }
 }

@@ -17,20 +17,20 @@ pub fn Home() -> Element {
     let mut timeline_loading = use_signal(|| false);
     let mut displayed_event_ids = use_signal(|| HashSet::<u64>::new());
 
-    let token = auth.token();
+    let credential = auth.user_id();
 
     // Load initial data.
     //
-    // `auth.token()` / `auth.is_authenticated()` are read inside the closure so
+    // `auth.user_id()` / `auth.is_authenticated()` are read inside the closure so
     // the effect re-runs on login and logout. Capturing them outside meant that
     // after logging in the heading switched to "Your Timeline" but no timeline
     // was ever fetched, leaving a permanently empty page until a manual reload.
     use_effect(move || {
-        let token_clone = auth.token();
+        let credential = auth.user_id();
         let is_authenticated = auth.is_authenticated();
 
         spawn(async move {
-            let client = ApiClient::new().with_token(token_clone.clone());
+            let client = ApiClient::new().with_user_id(credential.clone());
 
             if let Ok(db_stats) = client.get_stats().await {
                 stats.set(Some(db_stats));
@@ -79,7 +79,12 @@ pub fn Home() -> Element {
                 .unwrap_or_else(|| "ws://localhost:3000/ws/timeline".to_string())
         };
 
-        let _ws_state = use_websocket::<WebSocketMessage, _>(ws_url, move |msg: WebSocketMessage| {
+        // Pass the credential so the socket authenticates and receives this
+        // account's personal events, not just global ones.
+        let _ws_state = use_websocket::<WebSocketMessage, _>(
+            ws_url,
+            auth.user_id(),
+            move |msg: WebSocketMessage| {
             match msg {
                 WebSocketMessage::TimelineEvent { event } => {
                     let event_id = event.id;
@@ -92,7 +97,8 @@ pub fn Home() -> Element {
                     // Ignore other message types (Ping, Pong, Auth)
                 }
             }
-        });
+            },
+        );
     }
 
     let load_more_timeline = move |_| {
@@ -101,11 +107,11 @@ pub fn Home() -> Element {
         }
 
         let offset = timeline_offset();
-        let token_clone = token.clone();
+        let credential = credential.clone();
 
         spawn(async move {
             timeline_loading.set(true);
-            let client = ApiClient::new().with_token(token_clone);
+            let client = ApiClient::new().with_user_id(credential);
 
             if let Ok(timeline) = client.get_timeline(offset, 20).await {
                 let mut events = timeline_events.write();

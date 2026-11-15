@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use crate::id_generator::IdGenerator;
 use crate::models::{
-    PackageKey, PackageVersionKey, TimelineEventKey, UserKey, WorkerAnalysisKey,
+    PackageKey, PackageVersionKey, TimelineEventKey, WorkerAnalysisKey,
 };
-use crate::models::WorkerAnalysis;
+use crate::models::{ApiKey, WorkerAnalysis};
 use crate::*;
 
 macro_rules! impl_insert {
@@ -95,6 +95,7 @@ static MODELS: Lazy<Models> = Lazy::new(|| {
     models.define::<Vulnerability>().unwrap();
     models.define::<TimelineEvent>().unwrap();
     models.define::<WorkerAnalysis>().unwrap();
+    models.define::<ApiKey>().unwrap();
     models
 });
 
@@ -102,7 +103,6 @@ pub struct Database {
     pub db: native_db::Database<'static>,
     package_ids: Arc<IdGenerator>,
     version_ids: Arc<IdGenerator>,
-    user_ids: Arc<IdGenerator>,
     #[allow(dead_code)]
     vulnerability_ids: Arc<IdGenerator>,
     timeline_ids: Arc<IdGenerator>,
@@ -117,7 +117,6 @@ impl Database {
 
         let max_package_id = find_max_id!(r, Package);
         let max_version_id = find_max_id!(r, PackageVersion);
-        let max_user_id = find_max_id!(r, User);
         let max_vulnerability_id = find_max_id!(r, Vulnerability);
         let max_timeline_id = find_max_id!(r, TimelineEvent);
         let max_analysis_id = find_max_id!(r, WorkerAnalysis);
@@ -128,7 +127,6 @@ impl Database {
         // `IdGenerator::next` then fails loudly rather than wrapping to 0.
         let package_ids = Arc::new(IdGenerator::new(max_package_id.saturating_add(1)));
         let version_ids = Arc::new(IdGenerator::new(max_version_id.saturating_add(1)));
-        let user_ids = Arc::new(IdGenerator::new(max_user_id.saturating_add(1)));
         let vulnerability_ids = Arc::new(IdGenerator::new(max_vulnerability_id.saturating_add(1)));
         let timeline_ids = Arc::new(IdGenerator::new(max_timeline_id.saturating_add(1)));
         let analysis_ids = Arc::new(IdGenerator::new(max_analysis_id.saturating_add(1)));
@@ -137,11 +135,49 @@ impl Database {
             db,
             package_ids,
             version_ids,
-            user_ids,
             vulnerability_ids,
             timeline_ids,
             analysis_ids,
         })
+    }
+
+    /// Fail fast, and legibly, on a database written before the auth rewrite.
+    ///
+    /// `User` and `TimelineEvent` moved to native_model version 2 with no
+    /// backward migration, so v1 rows cannot be decoded. Without this check
+    /// the first scan to touch one surfaces a raw native_model decode error
+    /// from somewhere deep in a request handler, which tells an operator
+    /// nothing useful.
+    pub fn preflight(&self) -> Result<()> {
+        let r = self.db.r_transaction()?;
+
+        let users = r.scan().primary::<User>().and_then(|s| {
+            s.all()
+                .map(|iter| iter.collect::<Result<Vec<_>, _>>())
+        });
+        let events = r.scan().primary::<TimelineEvent>().and_then(|s| {
+            s.all()
+                .map(|iter| iter.collect::<Result<Vec<_>, _>>())
+        });
+
+        if users.is_err() || matches!(users, Ok(Err(_))) || events.is_err() || matches!(events, Ok(Err(_)))
+        {
+            anyhow::bail!(
+                "this database predates the user-id authentication rewrite and cannot be \
+                 opened.\n\n\
+                 The `User` and `TimelineEvent` tables moved to native_model version 2. \
+                 Version 1 rows stored a password hash, email and username, none of which \
+                 exist any more, and they carry no user id to migrate forward - so there is \
+                 no way to preserve a login.\n\n\
+                 To proceed, remove the database file and let the server recreate it:\n\
+                 \x20   rm -rf <DATABASE_PATH>\n\n\
+                 Package, version, vulnerability and analysis data live in the same file and \
+                 will be lost as well; export them first with `fossdb-server export` using \
+                 the previous build if you need them."
+            );
+        }
+
+        Ok(())
     }
 
     impl_insert!(insert_package, Package, package_ids);
@@ -177,25 +213,68 @@ impl Database {
 
     impl_get_all!(get_all_versions, PackageVersion);
 
-    impl_insert!(insert_user, User, user_ids);
-    impl_get!(get_user, User);
-
-    /// Exact lookup by email (a `unique` secondary key); see
-    /// [`Database::get_package_by_name`] for why this is not a prefix scan.
-    pub fn get_user_by_email(&self, email: &str) -> Result<Option<User>> {
-        let r = self.db.r_transaction()?;
-        Ok(r.get().secondary(UserKey::email, email)?)
+    /// Insert a user whose `user_id` has already been generated.
+    ///
+    /// Returns `Ok(None)` if that id is already taken, so the caller can
+    /// retry with fresh entropy rather than surfacing a 500. A collision is
+    /// vanishingly unlikely at 128 bits, but "unlikely" is not "impossible"
+    /// and the failure would otherwise be silent corruption of someone
+    /// else's account.
+    pub fn insert_user(&self, user: User) -> Result<Option<User>> {
+        let rw = self.db.rw_transaction()?;
+        if rw.get().primary::<User>(user.user_id.clone())?.is_some() {
+            return Ok(None);
+        }
+        rw.insert(user.clone())?;
+        rw.commit()?;
+        Ok(Some(user))
     }
 
-    /// Exact lookup by username (a `unique` secondary key).
-    #[allow(dead_code)]
-    pub fn get_user_by_username(&self, username: &str) -> Result<Option<User>> {
+    /// Exact primary-key lookup. This is the authentication hot path: every
+    /// authenticated request resolves its bearer credential through here.
+    pub fn get_user(&self, user_id: &str) -> Result<Option<User>> {
         let r = self.db.r_transaction()?;
-        Ok(r.get().secondary(UserKey::username, username)?)
+        Ok(r.get().primary(user_id.to_string())?)
     }
 
     impl_get_all!(get_all_users, User);
-    impl_update!(update_user, User);
+
+    pub fn update_user(&self, user: User) -> Result<()> {
+        let rw = self.db.rw_transaction()?;
+        if let Some(old) = rw.get().primary::<User>(user.user_id.clone())? {
+            rw.remove(old)?;
+        }
+        rw.insert(user)?;
+        rw.commit()?;
+        Ok(())
+    }
+
+    /// Delete an account and every timeline event belonging to it.
+    ///
+    /// Both happen in one transaction: a half-applied delete would leave
+    /// orphaned events that no longer resolve to an account but still occupy
+    /// the `user_id` index.
+    pub fn delete_user(&self, user_id: &str) -> Result<bool> {
+        let rw = self.db.rw_transaction()?;
+
+        let Some(user) = rw.get().primary::<User>(user_id.to_string())? else {
+            return Ok(false);
+        };
+
+        let events: Vec<TimelineEvent> = rw
+            .scan()
+            .secondary(TimelineEventKey::user_id)?
+            .start_with(Some(user_id.to_string()))?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        for event in events {
+            rw.remove(event)?;
+        }
+        rw.remove(user)?;
+        rw.commit()?;
+
+        Ok(true)
+    }
 
     impl_insert!(
         #[allow(dead_code)]
@@ -231,41 +310,62 @@ impl Database {
 
     impl_update!(update_timeline_event, TimelineEvent);
 
-    pub fn get_timeline_events_by_user(&self, user_id: u64) -> Result<Vec<TimelineEvent>> {
+    pub fn get_timeline_events_by_user(&self, user_id: &str) -> Result<Vec<TimelineEvent>> {
         let r = self.db.r_transaction()?;
         let events: Vec<TimelineEvent> = r
             .scan()
             .secondary(TimelineEventKey::user_id)?
-            .start_with(Some(user_id))?
+            .start_with(Some(user_id.to_string()))?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(events)
     }
 
-    pub fn get_pending_notifications(&self) -> Result<Vec<TimelineEvent>> {
-        let r = self.db.r_transaction()?;
-        let all_events: Vec<TimelineEvent> =
-            r.scan().primary()?.all()?.collect::<Result<Vec<_>, _>>()?;
-        Ok(all_events
-            .into_iter()
-            .filter(|e| {
-                e.user_id.is_some()
-                    && e.notified_at.is_none()
-                    && e.event_type == crate::EventType::NewRelease
-            })
-            .collect())
-    }
-
-    pub fn get_users_subscribed_to(&self, package_name: &str) -> Result<Vec<u64>> {
+    /// Accounts that should receive an event for `package_name`.
+    ///
+    /// Both notification switches are enforced here: the per-package one and
+    /// the account-wide one. The account-wide flag used to be checked only at
+    /// email-send time, so when the email subsystem was removed it would have
+    /// silently become a no-op; centralising it here keeps it meaningful for
+    /// websocket delivery and for feeds.
+    pub fn get_users_subscribed_to(&self, package_name: &str) -> Result<Vec<String>> {
         let all_users = self.get_all_users()?;
         Ok(all_users
             .into_iter()
+            .filter(|u| u.notifications_enabled)
             .filter(|u| {
                 u.subscriptions
                     .iter()
                     .any(|s| s.package_name == package_name && s.notifications_enabled)
             })
-            .map(|u| u.id)
+            .map(|u| u.user_id.clone())
             .collect())
+    }
+
+    /// Delete accounts that never subscribed to anything.
+    ///
+    /// An account is reaped once it is older than `grace` and holds no
+    /// subscriptions. Note this also reaps an established account that has
+    /// since removed its last subscription - there is no "was once active"
+    /// exemption, by design: an account with no subscriptions produces no
+    /// events and no feed, so retaining it serves no purpose.
+    pub fn purge_unsubscribed_users(&self, grace: chrono::Duration) -> Result<usize> {
+        let cutoff = chrono::Utc::now() - grace;
+
+        let stale: Vec<String> = self
+            .get_all_users()?
+            .into_iter()
+            .filter(|u| u.created_at < cutoff && u.subscriptions.is_empty())
+            .map(|u| u.user_id.clone())
+            .collect();
+
+        let mut purged = 0;
+        for user_id in stale {
+            if self.delete_user(&user_id)? {
+                purged += 1;
+            }
+        }
+
+        Ok(purged)
     }
 
     impl_insert!(insert_worker_analysis, WorkerAnalysis, analysis_ids);
@@ -290,6 +390,55 @@ impl Database {
             .start_with(version_id)?
             .collect::<Result<Vec<_>, _>>()?;
         Ok(analyses)
+    }
+
+    /// Store a newly minted API key.
+    pub fn insert_api_key(&self, key: ApiKey) -> Result<ApiKey> {
+        let rw = self.db.rw_transaction()?;
+        rw.insert(key.clone())?;
+        rw.commit()?;
+        Ok(key)
+    }
+
+    /// Look up a key by its non-secret id.
+    ///
+    /// This is the collector/worker authentication hot path.
+    pub fn get_api_key(&self, key_id: &str) -> Result<Option<ApiKey>> {
+        let r = self.db.r_transaction()?;
+        Ok(r.get().primary(key_id.to_string())?)
+    }
+
+    pub fn get_all_api_keys(&self) -> Result<Vec<ApiKey>> {
+        let r = self.db.r_transaction()?;
+        let all: Vec<ApiKey> = r.scan().primary()?.all()?.collect::<Result<Vec<_>, _>>()?;
+        Ok(all)
+    }
+
+    /// Mark a key revoked.
+    ///
+    /// A soft delete: the record stays so the key remains visible in an
+    /// audit listing, and so a revoked id is never reissued. Returns
+    /// `Ok(None)` if no such key exists, and the already-revoked key
+    /// unchanged if it was revoked before, so revoking twice is harmless.
+    pub fn revoke_api_key(&self, key_id: &str) -> Result<Option<ApiKey>> {
+        let rw = self.db.rw_transaction()?;
+
+        let Some(existing) = rw.get().primary::<ApiKey>(key_id.to_string())? else {
+            return Ok(None);
+        };
+
+        if existing.revoked_at.is_some() {
+            return Ok(Some(existing));
+        }
+
+        let mut revoked = existing.clone();
+        revoked.inner.revoked_at = Some(chrono::Utc::now());
+
+        rw.remove(existing)?;
+        rw.insert(revoked.clone())?;
+        rw.commit()?;
+
+        Ok(Some(revoked))
     }
 
     pub fn purge_old_timeline_events(&self, older_than: chrono::Duration) -> Result<usize> {

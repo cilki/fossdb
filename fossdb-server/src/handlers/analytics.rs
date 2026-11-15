@@ -2,15 +2,10 @@ use crate::AppState;
 use axum::{extract::State, http::StatusCode, response::Json};
 use serde::Serialize;
 
-#[derive(Serialize)]
-pub struct DatabaseStats {
-    pub total_packages: u64,
-    pub total_versions: u64,
-    pub total_users: u64,
-    pub total_vulnerabilities: u64,
-    pub total_timeline_events: u64,
-    pub collectors_running: Vec<String>,
-}
+// `DatabaseStats` comes from the shared `fossdb` crate. A local copy used to
+// shadow it here, which is the same class of drift that previously broke
+// `SubscriptionResponse`.
+use crate::DatabaseStats;
 
 #[derive(Serialize)]
 pub struct AnalyticsResponse {
@@ -272,7 +267,21 @@ pub async fn get_db_stats(
         total_users: users.len() as u64,
         total_vulnerabilities: vulnerabilities.len() as u64,
         total_timeline_events: timeline_events.len() as u64,
-        collectors_running: vec!["crates.io".to_string()],
+        // Derived from ingested data rather than hardcoded: these are the
+        // platforms packages have actually arrived from. The server cannot
+        // enumerate running collector processes - they are anonymous HTTP
+        // clients sharing one API key - so this reports evidence of
+        // collection, not liveness.
+        collectors_running: {
+            let mut platforms: Vec<String> = packages
+                .iter()
+                .filter_map(|p| p.platform.clone())
+                .collect::<std::collections::BTreeSet<_>>()
+                .into_iter()
+                .collect();
+            platforms.sort();
+            platforms
+        },
     };
 
     Ok(Json(stats))

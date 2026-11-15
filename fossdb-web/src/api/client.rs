@@ -39,7 +39,8 @@ pub struct PackageQuery<'a> {
 
 pub struct ApiClient {
     base_url: String,
-    token: Option<String>,
+    /// The account id, sent as a bearer credential.
+    user_id: Option<String>,
 }
 
 impl ApiClient {
@@ -57,12 +58,12 @@ impl ApiClient {
 
         Self {
             base_url,
-            token: None,
+            user_id: None,
         }
     }
 
-    pub fn with_token(mut self, token: Option<String>) -> Self {
-        self.token = token;
+    pub fn with_user_id(mut self, user_id: Option<String>) -> Self {
+        self.user_id = user_id;
         self
     }
 
@@ -86,10 +87,10 @@ impl ApiClient {
 
         request.headers().set("Content-Type", "application/json")?;
 
-        if let Some(token) = &self.token {
+        if let Some(user_id) = &self.user_id {
             request
                 .headers()
-                .set("Authorization", &format!("Bearer {}", token))?;
+                .set("Authorization", &format!("Bearer {}", user_id))?;
         }
 
         let window = web_sys::window().ok_or_else(|| JsValue::from_str("No window"))?;
@@ -124,25 +125,21 @@ impl ApiClient {
             .map_err(|e| JsValue::from_str(&format!("Deserialization error: {:?}", e)))
     }
 
-    pub async fn login(&self, email: String, password: String) -> Result<AuthResponse> {
-        let body = serde_json::to_string(&LoginRequest { email, password })
+    /// Confirm an id names a live account. No token is issued; the id the
+    /// caller already holds is the credential.
+    pub async fn login(&self, user_id: String) -> Result<AuthResponse> {
+        let body = serde_json::to_string(&LoginRequest { user_id })
             .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))?;
         self.request("POST", "/auth/login", Some(body)).await
     }
 
-    pub async fn register(
-        &self,
-        username: String,
-        email: String,
-        password: String,
-    ) -> Result<AuthResponse> {
-        let body = serde_json::to_string(&RegisterRequest {
-            username,
-            email,
-            password,
-        })
-        .map_err(|e| JsValue::from_str(&format!("Serialization error: {}", e)))?;
-        self.request("POST", "/auth/register", Some(body)).await
+    /// Create an account. Takes no input - the server mints the credential
+    /// and this is the only time it is ever disclosed.
+    pub async fn register(&self) -> Result<RegisterResponse> {
+        // An empty JSON body: the endpoint takes no parameters, but the
+        // request still advertises `Content-Type: application/json`.
+        self.request("POST", "/auth/register", Some("{}".to_string()))
+            .await
     }
 
     pub async fn get_stats(&self) -> Result<DatabaseStats> {

@@ -16,18 +16,18 @@ struct Config {
 }
 
 impl Config {
-    fn from_env() -> Self {
-        Self {
+    fn from_env() -> Result<Self> {
+        Ok(Self {
             server_url: std::env::var("SERVER_INTERNAL_URL")
                 .unwrap_or_else(|_| "http://localhost:3001".to_string()),
-            api_key: std::env::var("COLLECTOR_API_KEY")
-                .expect("COLLECTOR_API_KEY environment variable must be set"),
+            // Accepts `COLLECTOR_API_KEY` or `COLLECTOR_API_KEY_FILE`.
+            api_key: fossdb::secret_file::from_env("COLLECTOR_API_KEY")?,
             interval_hours: std::env::var("COLLECTOR_INTERVAL_HOURS")
                 .unwrap_or_else(|_| "1".to_string())
                 .parse()
                 .unwrap_or(1),
             libraries_io_api_key: std::env::var("LIBRARIES_IO_API_KEY").ok(),
-        }
+        })
     }
 }
 
@@ -36,7 +36,17 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
 
-    let config = Config::from_env();
+    let config = Config::from_env()?;
+
+    if !fossdb::api_key::is_well_formed(&config.api_key) {
+        tracing::warn!(
+            "COLLECTOR_API_KEY does not look like a fossdb API key (expected {} characters \
+             beginning with {:?}); the server will reject it",
+            fossdb::api_key::TOTAL_LEN,
+            fossdb::api_key::PREFIX
+        );
+    }
+
     let client = Arc::new(CollectorClient::new(config.server_url.clone(), config.api_key.clone())?);
 
     let mut collector_list: Vec<Arc<dyn Collector>> = vec![];

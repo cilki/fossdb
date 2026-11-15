@@ -1,6 +1,89 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+pub mod api_key;
+pub mod secret_file;
+pub mod user_id;
+
+pub use api_key::ApiKeyRole;
+
+/// A collector or worker API key as stored by the server.
+///
+/// Holds only a hash of the secret, so this type is safe to keep in the
+/// database but is still never returned to a client - the admin API returns
+/// [`ApiKeyInfo`] instead. See the guard test in this crate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKey {
+    /// Non-secret identifier, used for lookup and revocation.
+    pub key_id: String,
+    pub role: ApiKeyRole,
+    /// Hex SHA-256 of the secret component.
+    ///
+    /// A plain hash rather than a password KDF: the secret carries 128 bits
+    /// of entropy from a CSPRNG, so there is no dictionary to stretch
+    /// against, and this is verified on every collector and worker request.
+    pub secret_hash: String,
+    /// Operator-supplied note, e.g. which host holds the key.
+    pub label: Option<String>,
+    pub created_at: DateTime<Utc>,
+    /// Set when revoked. Revocation is a soft delete so that a withdrawn key
+    /// remains visible in `api-key list --all` rather than silently vanishing.
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// Public view of an API key. Carries no secret material.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyInfo {
+    pub key_id: String,
+    pub role: ApiKeyRole,
+    pub label: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+    /// When this key last authenticated a request.
+    ///
+    /// Tracked in memory only, so it resets when the server restarts. Keeping
+    /// it out of the database avoids a write on every worker poll.
+    pub last_used_at: Option<DateTime<Utc>>,
+    pub seconds_since_use: Option<i64>,
+}
+
+impl From<ApiKey> for ApiKeyInfo {
+    fn from(key: ApiKey) -> Self {
+        Self {
+            key_id: key.key_id,
+            role: key.role,
+            label: key.label,
+            created_at: key.created_at,
+            revoked_at: key.revoked_at,
+            last_used_at: None,
+            seconds_since_use: None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateApiKeyRequest {
+    pub role: ApiKeyRole,
+    pub label: Option<String>,
+}
+
+/// Response to key creation. The only time the secret is ever disclosed.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct CreateApiKeyResponse {
+    /// The complete key, to be handed to a collector or worker.
+    pub key: String,
+    pub info: ApiKeyInfo,
+}
+
+impl std::fmt::Debug for CreateApiKeyResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CreateApiKeyResponse")
+            .field("key", &"<redacted>")
+            .field("info", &self.info)
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Package {
     pub id: u64,
@@ -47,15 +130,20 @@ pub struct PackageSubscription {
     pub notifications_enabled: bool,
 }
 
+/// An account.
+///
+/// There is no password, no email and no username: the randomly generated
+/// [`User::user_id`] is the account's sole identifier *and* its sole
+/// credential. It is presented as a bearer token on the API and embedded in
+/// the user's feed URLs, so it must be treated as a secret everywhere it
+/// appears. See [`crate::user_id`] for the format.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct User {
-    pub id: u64,
-    pub email: String,
-    pub username: String,
-    pub password_hash: String,
+    pub user_id: String,
     pub subscriptions: Vec<PackageSubscription>,
     pub created_at: DateTime<Utc>,
-    pub is_verified: bool,
+    /// Global kill switch for this account's notifications. When false the
+    /// account produces no live websocket events and an empty feed.
     pub notifications_enabled: bool,
 }
 
@@ -89,14 +177,14 @@ pub struct AffectedPackage {
 pub struct TimelineEvent {
     pub id: u64,
     pub package_id: u64,
-    pub user_id: Option<u64>,
+    /// Owning account, or `None` for a global (non-personal) event.
+    pub user_id: Option<String>,
     pub event_type: EventType,
     pub package_name: String,
     pub version: Option<String>,
     pub message: String,
     pub metadata: Option<String>,
     pub created_at: DateTime<Utc>,
-    pub notified_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -119,25 +207,46 @@ pub struct CreatePackageRequest {
     pub tags: Vec<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct RegisterRequest {
-    pub username: String,
-    pub email: String,
-    pub password: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
+/// Sent to `POST /api/auth/login`.
+///
+/// `Debug` deliberately redacts the id: it is a live credential, and this type
+/// is the one most likely to end up in a log line or an error report.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct LoginRequest {
-    pub email: String,
-    pub password: String,
+    pub user_id: String,
 }
 
-/// Returned by the login/register endpoints. Carries the public-facing
-/// [`UserResponse`] rather than the stored [`User`], so the password hash
-/// never leaves the server.
+impl std::fmt::Debug for LoginRequest {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LoginRequest")
+            .field("user_id", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Returned by `POST /api/auth/register`.
+///
+/// This is the only time the server ever discloses a freshly minted id. It is
+/// not recoverable afterwards - the client must persist it.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct RegisterResponse {
+    pub user_id: String,
+    pub created_at: DateTime<Utc>,
+}
+
+impl std::fmt::Debug for RegisterResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RegisterResponse")
+            .field("user_id", &"<redacted>")
+            .field("created_at", &self.created_at)
+            .finish()
+    }
+}
+
+/// Returned by `POST /api/auth/login`. Carries no token: the id the caller
+/// already holds *is* the credential, so there is nothing further to issue.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthResponse {
-    pub token: String,
     pub user: UserResponse,
 }
 
@@ -175,21 +284,24 @@ pub struct TimelineResponse {
     pub offset: usize,
 }
 
+/// Public view of an account.
+///
+/// Deliberately omits `user_id`: a caller who needs it already has it, and
+/// keeping it out of general-purpose responses stops the credential from
+/// being echoed into places it does not belong.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct UserResponse {
-    pub id: u64,
-    pub username: String,
-    pub email: String,
     pub created_at: String,
+    pub subscription_count: usize,
+    pub notifications_enabled: bool,
 }
 
 impl From<User> for UserResponse {
     fn from(user: User) -> Self {
         Self {
-            id: user.id,
-            username: user.username,
-            email: user.email,
             created_at: user.created_at.to_rfc3339(),
+            subscription_count: user.subscriptions.len(),
+            notifications_enabled: user.notifications_enabled,
         }
     }
 }
@@ -282,42 +394,135 @@ pub enum FindingSeverity {
     Critical,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WebSocketMessage {
-    Auth { token: String },
+    /// Sent by the client immediately after the socket opens to bind the
+    /// connection to an account, so it receives that account's events rather
+    /// than only global ones.
+    Auth { user_id: String },
     Ping,
     Pong,
     TimelineEvent { event: TimelineEvent },
+}
+
+impl std::fmt::Debug for WebSocketMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            // Never render the credential, even in a trace log.
+            Self::Auth { .. } => f.write_str("Auth { user_id: <redacted> }"),
+            Self::Ping => f.write_str("Ping"),
+            Self::Pong => f.write_str("Pong"),
+            Self::TimelineEvent { event } => {
+                f.debug_struct("TimelineEvent").field("event", event).finish()
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn auth_response_does_not_expose_password_hash() {
-        let user = User {
-            id: 7,
-            email: "alice@example.com".into(),
-            username: "alice".into(),
-            password_hash: "$2b$12$secret-hash".into(),
-            subscriptions: Vec::new(),
+    fn sample_user() -> User {
+        User {
+            user_id: "fdb_0123456789abcdefghjkmnpqrs".into(),
+            subscriptions: vec![PackageSubscription {
+                package_name: "serde".into(),
+                notifications_enabled: true,
+            }],
             created_at: Utc::now(),
-            is_verified: false,
             notifications_enabled: true,
-        };
+        }
+    }
 
-        let response = AuthResponse {
-            token: "jwt".into(),
-            user: user.into(),
-        };
+    /// The id is a bearer credential. `UserResponse` is returned from general
+    /// endpoints, so it must never carry it - this is the same class of bug as
+    /// the `password_hash` leak this type previously guarded against.
+    #[test]
+    fn user_response_does_not_expose_the_credential() {
+        let user = sample_user();
+        let secret = user.user_id.clone();
+
+        let response = AuthResponse { user: user.into() };
 
         let json = serde_json::to_value(&response).unwrap();
-        assert!(json["user"].get("password_hash").is_none());
-        assert!(!json.to_string().contains("secret-hash"));
-        assert_eq!(json["user"]["id"], 7);
-        assert_eq!(json["user"]["username"], "alice");
-        assert_eq!(json["user"]["email"], "alice@example.com");
+        assert!(json["user"].get("user_id").is_none());
+        assert!(!json.to_string().contains(&secret));
+        assert_eq!(json["user"]["subscription_count"], 1);
+    }
+
+    /// Credential-bearing types are the ones most likely to be logged, so
+    /// their `Debug` impls are hand-written to redact. Guard that.
+    #[test]
+    fn debug_impls_redact_the_credential() {
+        let secret = "fdb_0123456789abcdefghjkmnpqrs";
+
+        let login = LoginRequest { user_id: secret.into() };
+        assert!(!format!("{login:?}").contains(secret));
+
+        let register = RegisterResponse {
+            user_id: secret.into(),
+            created_at: Utc::now(),
+        };
+        assert!(!format!("{register:?}").contains(secret));
+
+        let auth = WebSocketMessage::Auth { user_id: secret.into() };
+        assert!(!format!("{auth:?}").contains(secret));
+    }
+
+    /// `ApiKeyInfo` is what the admin API returns. It must not carry the
+    /// secret hash, for the same reason `UserResponse` carries no id.
+    #[test]
+    fn api_key_info_does_not_expose_the_hash() {
+        let key = ApiKey {
+            key_id: "4m7k2xqa".into(),
+            role: ApiKeyRole::Worker,
+            secret_hash: "deadbeefcafe".into(),
+            label: Some("worker-01".into()),
+            created_at: Utc::now(),
+            revoked_at: None,
+        };
+
+        let json = serde_json::to_value(ApiKeyInfo::from(key)).unwrap();
+
+        assert!(json.get("secret_hash").is_none());
+        assert!(!json.to_string().contains("deadbeefcafe"));
+        assert_eq!(json["key_id"], "4m7k2xqa");
+        assert_eq!(json["role"], "worker");
+    }
+
+    #[test]
+    fn create_api_key_response_redacts_the_key_in_debug() {
+        let secret = "fdbk_4m7k2xqa_3k9x7m2qdv5r8ptw1ny6az4cbf";
+        let response = CreateApiKeyResponse {
+            key: secret.into(),
+            info: ApiKeyInfo {
+                key_id: "4m7k2xqa".into(),
+                role: ApiKeyRole::Collector,
+                label: None,
+                created_at: Utc::now(),
+                revoked_at: None,
+                last_used_at: None,
+                seconds_since_use: None,
+            },
+        };
+
+        assert!(!format!("{response:?}").contains(secret));
+    }
+
+    /// The wire format is what the CLI and the browser both parse; pin it.
+    #[test]
+    fn register_response_round_trips() {
+        let original = RegisterResponse {
+            user_id: "fdb_0123456789abcdefghjkmnpqrs".into(),
+            created_at: Utc::now(),
+        };
+
+        let json = serde_json::to_string(&original).unwrap();
+        let parsed: RegisterResponse = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.user_id, original.user_id);
+        assert_eq!(parsed.created_at, original.created_at);
     }
 }

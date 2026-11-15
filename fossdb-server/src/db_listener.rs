@@ -85,14 +85,13 @@ async fn handle_package_version_event(
                     inner: fossdb::TimelineEvent {
                         id: 0,
                         package_id: package.id,
-                        user_id: Some(user_id),
+                        user_id: Some(user_id.clone()),
                         event_type: EventType::NewRelease,
                         package_name: package.name.clone(),
                         version: Some(version.version.clone()),
                         message: format!("New version {} released", version.version),
                         metadata: None,
                         created_at: now,
-                        notified_at: None,
                     },
                 };
 
@@ -138,7 +137,6 @@ async fn handle_package_version_event(
             message: format!("New version {} released", version.version),
             metadata: None,
             created_at: now,
-            notified_at: None,
         },
     };
 

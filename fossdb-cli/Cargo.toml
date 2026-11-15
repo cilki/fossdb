@@ -1,0 +1,44 @@
+[package]
+name = "fossdb-cli"
+description = "FossDB command line client"
+version.workspace = true
+edition.workspace = true
+authors = ["cilki"]
+repository = "https://github.com/fossable/fossdb/"
+license = "Unlicense"
+
+# The user-facing command is `fossdb`; the crate is named fossdb-cli so it does
+# not collide with the shared types crate.
+[[bin]]
+name = "fossdb"
+path = "src/main.rs"
+
+[features]
+default = []
+# Administrative commands, which talk to fossdb-server over its unix socket.
+# Off by default: these are only useful on a host running the server, and they
+# pull in a raw HTTP client that ordinary users do not need.
+admin = ["dep:hyper", "dep:hyper-util", "dep:http-body-util"]
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+# `default-features = false` keeps this in step with fossdb-web: the shared
+# crate must stay free of anything platform-specific.
+fossdb = { path = "../fossdb", version = "0.0.1", default-features = false }
+
+clap = { version = "4.5", features = ["derive", "env"] }
+reqwest = { version = "0.13.5", default-features = false, features = [
+  "json",
+  "rustls",
+] }
+tokio = { version = "1.0", features = ["rt-multi-thread", "macros", "net", "io-util", "time"] }
+
+# Admin transport. reqwest cannot speak to a unix socket, so the admin
+# commands drive hyper's HTTP/1 client over a UnixStream directly.
+hyper = { version = "1.12", features = ["client", "http1"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio"], optional = true }
+http-body-util = { version = "0.1", optional = true }

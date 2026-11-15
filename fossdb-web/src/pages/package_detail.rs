@@ -15,7 +15,7 @@ pub fn PackageDetail(id: String) -> Element {
     let mut page_size = use_signal(|| 10);
     let mut current_page = use_signal(|| 0);
 
-    let token = auth.token();
+    let credential = auth.user_id();
 
     // Name of the loaded package. The subscription endpoints key on package
     // *name*, while the route parameter is a numeric id, so the name has to be
@@ -24,19 +24,19 @@ pub fn PackageDetail(id: String) -> Element {
 
     // Load package data.
     //
-    // `id` and `auth.token()` are read inside the closure so the effect is
+    // `id` and `auth.user_id()` are read inside the closure so the effect is
     // subscribed to them and re-runs when the route parameter changes or the
     // user logs in/out. Previously both were captured as plain clones, so
     // navigating from /packages/1 to /packages/2 left the first package's data
     // on screen.
     use_effect(move || {
         let pkg_id = id.clone();
-        let token_clone = auth.token();
+        let credential = auth.user_id();
         let is_authenticated = auth.is_authenticated();
 
         loading.set(true);
         spawn(async move {
-            let client = ApiClient::new().with_token(token_clone.clone());
+            let client = ApiClient::new().with_user_id(credential.clone());
 
             let loaded = client.get_package(&pkg_id).await.ok();
             if let Some(pkg) = &loaded {
@@ -115,11 +115,11 @@ pub fn PackageDetail(id: String) -> Element {
 
     let notif = use_notifications();
 
-    let token_for_subscribe = token.clone();
+    let credential_for_subscribe = credential.clone();
 
     let handle_subscribe = move |_| {
         let mut notif_copy = notif;
-        let token_clone = token_for_subscribe.clone();
+        let credential = credential_for_subscribe.clone();
         // Subscription endpoints key on package name, not the numeric route id.
         let pkg_name = package_name();
 
@@ -129,7 +129,7 @@ pub fn PackageDetail(id: String) -> Element {
                 return;
             }
 
-            let client = ApiClient::new().with_token(token_clone);
+            let client = ApiClient::new().with_user_id(credential);
 
             if is_subscribed() {
                 match client.unsubscribe(&pkg_name).await {
@@ -155,11 +155,11 @@ pub fn PackageDetail(id: String) -> Element {
         });
     };
 
-    let token_for_toggle = token.clone();
+    let credential_for_toggle = credential.clone();
 
     let toggle_notifications = move |_| {
         let mut notif_copy = notif;
-        let token_clone = token_for_toggle.clone();
+        let credential = credential_for_toggle.clone();
         let pkg_name = package_name();
 
         spawn(async move {
@@ -168,7 +168,7 @@ pub fn PackageDetail(id: String) -> Element {
                 return;
             }
 
-            let client = ApiClient::new().with_token(token_clone);
+            let client = ApiClient::new().with_user_id(credential);
             let new_state = !notifications_enabled();
 
             match client.toggle_notifications(&pkg_name, new_state).await {

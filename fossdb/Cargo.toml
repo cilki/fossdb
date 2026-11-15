@@ -3,15 +3,13 @@ name = "fossdb"
 version.workspace = true
 edition.workspace = true
 
+# Shared wire types only. Kept dependency-free enough to compile to wasm32 for
+# fossdb-web; the CLI lives in fossdb-cli so that clap and an HTTP stack never
+# enter this crate's graph.
+
 [dependencies]
-anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true
-clap = { version = "4.5", features = ["derive"], optional = true }
 
 [dev-dependencies]
 serde_json.workspace = true
-
-[features]
-default = ["cli"]
-cli = ["dep:clap"]

@@ -55,6 +55,15 @@ impl ClaimSet {
     pub fn is_empty(&self) -> bool {
         self.claims.is_empty()
     }
+
+    /// Iterate live claims as `(version_id, claimed_at)`.
+    ///
+    /// Used by the admin socket to report in-flight work. Note this may
+    /// include claims that have expired but not yet been pruned, so callers
+    /// that care should compare against [`CLAIM_TTL`].
+    pub fn iter(&self) -> impl Iterator<Item = (&u64, &Instant)> {
+        self.claims.iter()
+    }
 }
 
 #[cfg(test)]

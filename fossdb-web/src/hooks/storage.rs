@@ -2,7 +2,9 @@ use gloo_storage::{LocalStorage as GlooLocalStorage, Storage};
 use serde::{Deserialize, Serialize};
 
 pub enum StorageKey {
-    AuthToken,
+    /// The account id. This is a credential, not a session token - see
+    /// [`crate::hooks::auth`].
+    UserId,
     UserData,
     Subscriptions,
     ViewMode,
@@ -11,7 +13,7 @@ pub enum StorageKey {
 impl StorageKey {
     fn as_str(&self) -> &str {
         match self {
-            StorageKey::AuthToken => "auth_token",
+            StorageKey::UserId => "user_id",
             StorageKey::UserData => "user_data",
             StorageKey::Subscriptions => "subscriptions",
             StorageKey::ViewMode => "view_mode",

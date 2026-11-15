@@ -12,17 +12,18 @@ struct Config {
 }
 
 impl Config {
-    fn from_env() -> Self {
-        Self {
+    fn from_env() -> Result<Self> {
+        Ok(Self {
             server_url: std::env::var("WORKER_SERVER_URL")
                 .unwrap_or_else(|_| "http://localhost:3002".to_string()),
-            api_key: std::env::var("WORKER_API_KEY")
-                .expect("WORKER_API_KEY environment variable must be set"),
+            // Accepts `WORKER_API_KEY` or `WORKER_API_KEY_FILE`; the latter is
+            // what a service manager hands over via systemd credentials.
+            api_key: fossdb::secret_file::from_env("WORKER_API_KEY")?,
             interval_secs: std::env::var("WORKER_INTERVAL_SECS")
                 .unwrap_or_else(|_| "60".to_string())
                 .parse()
                 .unwrap_or(60),
-        }
+        })
     }
 }
 
@@ -31,8 +32,17 @@ async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt::init();
 
-    let config = Config::from_env();
+    let config = Config::from_env()?;
     let client = WorkerClient::new(config.server_url.clone(), config.api_key.clone())?;
+
+    if !fossdb::api_key::is_well_formed(&config.api_key) {
+        tracing::warn!(
+            "WORKER_API_KEY does not look like a fossdb API key (expected {} characters \
+             beginning with {:?}); the server will reject it",
+            fossdb::api_key::TOTAL_LEN,
+            fossdb::api_key::PREFIX
+        );
+    }
 
     tracing::info!("Worker started, connecting to {}", config.server_url);
 

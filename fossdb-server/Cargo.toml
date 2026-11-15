@@ -18,7 +18,7 @@ path = "src/main.rs"
 required-features = ["api-server"]
 
 [features]
-default = ["api-server", "email"]
+default = ["api-server"]
 db = ["dep:native_db", "dep:native_model", "dep:once_cell"]
 api-server = [
   "db",
@@ -26,14 +26,15 @@ api-server = [
   "dep:axum",
   "dep:tower",
   "dep:tower-http",
-  "dep:bcrypt",
-  "dep:jsonwebtoken",
   "dep:tracing",
   "dep:tracing-subscriber",
   "dep:dotenvy",
   "dep:tokio-util",
+  "dep:getrandom",
+  "dep:sha2",
+  "dep:atom_syndication",
+  "dep:rss",
 ]
-email = ["dep:tokio", "dep:lettre", "dep:tera", "dep:once_cell", "dep:tracing"]
 
 [dependencies]
 # Workspace dependencies
@@ -57,22 +58,24 @@ tokio = { version = "1.0", features = ["full"], optional = true }
 axum = { version = "0.8.9", features = ["ws"], optional = true }
 tower = { version = "0.5.3", optional = true }
 tower-http = { version = "0.7.1", features = ["cors", "fs"], optional = true }
-bcrypt = { version = "0.19.3", optional = true }
-jsonwebtoken = { version = "12.0.0", features = [
-  "rust_crypto",
-], optional = true }
 tracing = { version = "0.1", optional = true }
 tracing-subscriber = { version = "0.3", optional = true }
 dotenvy = { version = "0.15", optional = true }
 tokio-util = { version = "0.7", optional = true }
-# Email dependencies
-lettre = { version = "0.11", default-features = false, features = [
-  "tokio1",
-  "tokio1-rustls-tls",
-  "smtp-transport",
-  "builder",
-], optional = true }
-tera = { version = "1.20", optional = true }
+
+# Account credentials and API keys are drawn straight from the OS CSPRNG.
+getrandom = { version = "0.4", optional = true }
+
+# API key secrets are stored hashed. A plain digest is sufficient: the secret
+# is 128 bits from a CSPRNG, so there is no dictionary to stretch against.
+sha2 = { version = "0.11", optional = true }
+
+# Feed serialisation. Package names and descriptions originate from third
+# party registries and flow verbatim into the feed, so XML escaping is
+# delegated to these rather than hand-rolled.
+atom_syndication = { version = "0.12", optional = true }
+rss = { version = "2.0", optional = true }
+
 once_cell = { version = "1.19", optional = true }
 
 # Database dependencies
