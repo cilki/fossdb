@@ -1,19 +1,46 @@
 use anyhow::Result;
 use fossdb::{AnalysisFinding, FindingKind, FindingSeverity};
 use regex::Regex;
+use std::io::Read;
 use std::path::Path;
 
-pub fn analyze_archive(path: &Path) -> Result<Vec<AnalysisFinding>> {
-    let name = path.to_string_lossy().to_lowercase();
+/// Source archive formats the worker knows how to unpack.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArchiveFormat {
+    TarGz,
+    TarBz2,
+    Zip,
+}
 
-    if name.ends_with(".tar.gz") || name.ends_with(".tgz") {
-        extract_and_analyze_targz(path)
-    } else if name.ends_with(".tar.bz2") || name.ends_with(".tbz2") {
-        extract_and_analyze_tarbz2(path)
-    } else if name.ends_with(".zip") {
-        extract_and_analyze_zip(path)
+/// Sniff the archive format from the file's leading bytes.
+///
+/// Download URLs are not a reliable signal: crates.io serves gzipped tarballs
+/// from `/api/v1/crates/<name>/<version>/download` with no extension at all,
+/// and the file is always written to an extension-less temp path anyway.
+pub fn detect_format(path: &Path) -> Result<Option<ArchiveFormat>> {
+    let mut file = std::fs::File::open(path)?;
+    let mut magic = [0u8; 4];
+    let n = file.read(&mut magic)?;
+    Ok(detect_format_from_magic(&magic[..n]))
+}
+
+fn detect_format_from_magic(magic: &[u8]) -> Option<ArchiveFormat> {
+    if magic.starts_with(&[0x1f, 0x8b]) {
+        Some(ArchiveFormat::TarGz)
+    } else if magic.starts_with(b"BZh") {
+        Some(ArchiveFormat::TarBz2)
+    } else if magic.starts_with(b"PK\x03\x04") || magic.starts_with(b"PK\x05\x06") {
+        Some(ArchiveFormat::Zip)
     } else {
-        Ok(vec![])
+        None
+    }
+}
+
+pub fn analyze_archive(path: &Path, format: ArchiveFormat) -> Result<Vec<AnalysisFinding>> {
+    match format {
+        ArchiveFormat::TarGz => extract_and_analyze_targz(path),
+        ArchiveFormat::TarBz2 => extract_and_analyze_tarbz2(path),
+        ArchiveFormat::Zip => extract_and_analyze_zip(path),
     }
 }
 
@@ -204,4 +231,67 @@ fn scan_secrets(content: &str, location: &str) -> Vec<AnalysisFinding> {
         }
     }
     findings
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_format_by_magic_bytes() {
+        assert_eq!(detect_format_from_magic(&[0x1f, 0x8b, 0x08, 0x00]), Some(ArchiveFormat::TarGz));
+        assert_eq!(detect_format_from_magic(b"BZh9"), Some(ArchiveFormat::TarBz2));
+        assert_eq!(detect_format_from_magic(b"PK\x03\x04"), Some(ArchiveFormat::Zip));
+        assert_eq!(detect_format_from_magic(b"\x7fELF"), None);
+        assert_eq!(detect_format_from_magic(b"MZ"), None);
+        assert_eq!(detect_format_from_magic(b""), None);
+    }
+
+    /// A crates.io `.crate` file is a gzipped tarball served from a URL with no
+    /// extension, and the worker always writes downloads to an extension-less
+    /// temp file. Source analysis must still run on it.
+    #[cfg(feature = "analysis-source")]
+    #[test]
+    fn analyzes_extensionless_targz() {
+        use flate2::{Compression, write::GzEncoder};
+
+        let mit = "MIT License\n\nPermission is hereby granted, free of charge, to any person...";
+        let src = "const TOKEN: &str = \"ghp_abcdefghijklmnopqrstuvwxyz0123456789\";\n";
+
+        let mut builder = tar::Builder::new(GzEncoder::new(Vec::new(), Compression::default()));
+        for (name, content) in [("pkg-1.0.0/LICENSE", mit), ("pkg-1.0.0/src/lib.rs", src)] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(content.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, name, content.as_bytes()).unwrap();
+        }
+        let bytes = builder.into_inner().unwrap().finish().unwrap();
+
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), &bytes).unwrap();
+        assert!(tmp.path().extension().is_none());
+
+        let format = detect_format(tmp.path()).unwrap().expect("gzip should be detected");
+        assert_eq!(format, ArchiveFormat::TarGz);
+
+        let findings = analyze_archive(tmp.path(), format).unwrap();
+        assert!(
+            findings.iter().any(|f| f.kind == FindingKind::LicenseDetected
+                && f.description == "License file detected: MIT"),
+            "expected MIT license finding, got {:?}",
+            findings
+        );
+        assert!(
+            findings.iter().any(|f| f.kind == FindingKind::SecretDetected
+                && f.location.as_deref() == Some("pkg-1.0.0/src/lib.rs")),
+            "expected secret finding, got {:?}",
+            findings
+        );
+        assert!(
+            !findings.iter().any(|f| f.kind == FindingKind::LicenseMismatch),
+            "license was present, got {:?}",
+            findings
+        );
+    }
 }

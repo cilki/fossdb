@@ -50,24 +50,19 @@ pub async fn analyze(task: &WorkerTask, http: &reqwest::Client) -> Result<Worker
         None
     };
 
-    // Detect format and dispatch to appropriate analyzer
-    let url_lower = download_url.to_lowercase();
-    let is_archive = url_lower.ends_with(".tar.gz")
-        || url_lower.ends_with(".tgz")
-        || url_lower.ends_with(".tar.bz2")
-        || url_lower.ends_with(".tbz2")
-        || url_lower.ends_with(".zip");
-
-    if is_archive {
-        match source::analyze_archive(tmp.path()) {
-            Ok(mut source_findings) => findings.append(&mut source_findings),
-            Err(e) => tracing::warn!("Source analysis failed: {}", e),
+    // Detect format from the file contents and dispatch to appropriate analyzer
+    match source::detect_format(tmp.path())? {
+        Some(format) => {
+            tracing::debug!("Detected source archive format {:?}", format);
+            match source::analyze_archive(tmp.path(), format) {
+                Ok(mut source_findings) => findings.append(&mut source_findings),
+                Err(e) => tracing::warn!("Source analysis failed: {}", e),
+            }
         }
-    } else {
-        match binary::analyze(tmp.path()) {
+        None => match binary::analyze(tmp.path()) {
             Ok(mut binary_findings) => findings.append(&mut binary_findings),
             Err(e) => tracing::warn!("Binary analysis failed: {}", e),
-        }
+        },
     }
 
     // Check if detected license matches declared license
