@@ -132,10 +132,13 @@ pub struct LoginRequest {
     pub password: String,
 }
 
+/// Returned by the login/register endpoints. Carries the public-facing
+/// [`UserResponse`] rather than the stored [`User`], so the password hash
+/// never leaves the server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthResponse {
     pub token: String,
-    pub user: User,
+    pub user: UserResponse,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -279,4 +282,35 @@ pub enum WebSocketMessage {
     Ping,
     Pong,
     TimelineEvent { event: TimelineEvent },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auth_response_does_not_expose_password_hash() {
+        let user = User {
+            id: 7,
+            email: "alice@example.com".into(),
+            username: "alice".into(),
+            password_hash: "$2b$12$secret-hash".into(),
+            subscriptions: Vec::new(),
+            created_at: Utc::now(),
+            is_verified: false,
+            notifications_enabled: true,
+        };
+
+        let response = AuthResponse {
+            token: "jwt".into(),
+            user: user.into(),
+        };
+
+        let json = serde_json::to_value(&response).unwrap();
+        assert!(json["user"].get("password_hash").is_none());
+        assert!(!json.to_string().contains("secret-hash"));
+        assert_eq!(json["user"]["id"], 7);
+        assert_eq!(json["user"]["username"], "alice");
+        assert_eq!(json["user"]["email"], "alice@example.com");
+    }
 }

@@ -62,7 +62,7 @@ async fn register_user(
 
     Ok(Json(AuthResponse {
         token,
-        user: user.inner,
+        user: user.inner.into(),
     }))
 }
 
@@ -104,6 +104,6 @@ async fn login_user(
 
     Ok(Json(AuthResponse {
         token,
-        user: user.inner,
+        user: user.inner.into(),
     }))
 }

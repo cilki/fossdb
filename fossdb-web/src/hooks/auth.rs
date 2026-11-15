@@ -35,12 +35,11 @@ impl AuthContext {
         self.auth_state.read().user.clone()
     }
 
-    pub fn login(&mut self, token: String, user: User) {
-        let user_response = UserResponse::from(user);
+    pub fn login(&mut self, token: String, user: UserResponse) {
         let _ = LocalStorage::set(StorageKey::AuthToken, &token);
-        let _ = LocalStorage::set(StorageKey::UserData, &user_response);
-        self.auth_state.write().token = Some(token.clone());
-        self.auth_state.write().user = Some(user_response.clone());
+        let _ = LocalStorage::set(StorageKey::UserData, &user);
+        self.auth_state.write().token = Some(token);
+        self.auth_state.write().user = Some(user);
     }
 
     pub fn logout(&mut self) {
