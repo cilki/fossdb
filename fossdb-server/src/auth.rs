@@ -38,7 +38,7 @@ pub fn create_jwt(user_id: &str, username: &str) -> Result<String> {
     let token = encode(
         &Header::default(),
         &claims,
-        &EncodingKey::from_secret(secret.as_ref()),
+        &EncodingKey::from_secret(secret.as_ref())?,
     )?;
     Ok(token)
 }
@@ -48,7 +48,7 @@ pub fn verify_jwt(token: &str) -> Result<Claims> {
     let secret = config.jwt_secret;
     let token_data = decode::<Claims>(
         token,
-        &DecodingKey::from_secret(secret.as_ref()),
+        &DecodingKey::from_secret(secret.as_ref())?,
         &Validation::default(),
     )?;
     Ok(token_data.claims)

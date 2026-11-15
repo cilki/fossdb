@@ -17,7 +17,8 @@ pub use models::{Package, PackageVersion, TimelineEvent, User, Vulnerability, Wo
 
 #[cfg(feature = "api-server")]
 pub mod auth;
-#[cfg(feature = "api-server")]
+// Read by both the API server and the email service.
+#[cfg(any(feature = "api-server", feature = "email"))]
 pub mod config;
 #[cfg(feature = "api-server")]
 pub mod db_listener;
@@ -43,6 +44,7 @@ pub struct AppState {
 #[cfg(feature = "email")]
 pub mod email;
 
-#[cfg(feature = "email")]
+// The notification processor reads pending events from the database.
+#[cfg(all(feature = "db", feature = "email"))]
 pub mod notifications;
 

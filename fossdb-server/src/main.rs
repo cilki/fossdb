@@ -34,7 +34,6 @@ struct Args {
 #[derive(clap::Subcommand, Debug)]
 enum Commands {
     /// Start the API server (default)
-    #[cfg(feature = "api-server")]
     Serve,
     /// Export database tables to JSON files
     #[cfg(feature = "db")]
@@ -71,19 +70,8 @@ async fn main() -> Result<()> {
         Some(Commands::Import { input, merge }) => {
             return import_database(&config, input, merge).await;
         }
-        #[cfg(feature = "api-server")]
-        Some(Commands::Serve) => {
-            return start_server(config).await;
-        }
-        None => {
-            #[cfg(feature = "api-server")]
-            return start_server(config).await;
-            #[cfg(not(feature = "api-server"))]
-            {
-                std::future::pending::<()>().await;
-                Ok(())
-            }
-        }
+        Some(Commands::Serve) => start_server(config).await,
+        None => start_server(config).await,
     }
 }
 
