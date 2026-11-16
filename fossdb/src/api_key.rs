@@ -5,7 +5,7 @@
 //! ```text
 //! fdbk_4m7k2xqa_3k9x7m2qdv5r8ptw1ny6az4cbf
 //! ^^^^ ^------^ ^------------------------^
-//! |    key id   secret (128 bits)
+//! |    key id   secret (130 bits)
 //! prefix
 //! ```
 //!
@@ -35,11 +35,8 @@ pub const SECRET_LEN: usize = 26;
 /// Total length of a canonical key.
 pub const TOTAL_LEN: usize = PREFIX.len() + ID_LEN + 1 + SECRET_LEN;
 
-/// Crockford base32 digits, lowercase; shared with [`crate::user_id`].
-pub const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
-
-/// Entropy backing the secret component.
-pub const SECRET_ENTROPY_BYTES: usize = 16;
+/// Crockford base32 digits, lowercase; the same alphabet as account ids.
+pub use crate::user_id::ALPHABET;
 
 /// Which internal API a key grants access to.
 ///

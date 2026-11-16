@@ -153,40 +153,19 @@ fn validators(rendered: &feed::Feed) -> Vec<(header::HeaderName, HeaderValue)> {
 }
 
 fn ok(rendered: &feed::Feed) -> Response {
-    let mut response = (StatusCode::OK, rendered.body.clone()).into_response();
-    let headers = response.headers_mut();
-
-    headers.insert(
-        header::CONTENT_TYPE,
-        HeaderValue::from_static_or_fallback(rendered.content_type),
-    );
-    for (name, value) in validators(rendered) {
-        headers.insert(name, value);
-    }
-
+    let mut response = (
+        [(header::CONTENT_TYPE, rendered.content_type)],
+        rendered.body.clone(),
+    )
+        .into_response();
+    response.headers_mut().extend(validators(rendered));
     response
 }
 
 fn not_modified(rendered: &feed::Feed) -> Response {
     let mut response = StatusCode::NOT_MODIFIED.into_response();
-    let headers = response.headers_mut();
-
-    for (name, value) in validators(rendered) {
-        headers.insert(name, value);
-    }
-
+    response.headers_mut().extend(validators(rendered));
     response
-}
-
-/// Small helper so a malformed content type cannot panic a request.
-trait HeaderValueExt {
-    fn from_static_or_fallback(s: &str) -> HeaderValue;
-}
-
-impl HeaderValueExt for HeaderValue {
-    fn from_static_or_fallback(s: &str) -> HeaderValue {
-        HeaderValue::from_str(s).unwrap_or_else(|_| HeaderValue::from_static("application/xml"))
-    }
 }
 
 #[cfg(test)]

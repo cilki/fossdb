@@ -3,9 +3,11 @@
 //! The format is defined in [`fossdb::api_key`]; only the parts needing a
 //! CSPRNG and a hash function live here.
 
-use anyhow::{Context, Result};
-use fossdb::api_key::{ALPHABET, ID_LEN, PREFIX, SECRET_ENTROPY_BYTES, SECRET_LEN};
+use anyhow::Result;
+use fossdb::api_key::{ID_LEN, PREFIX, SECRET_LEN};
 use sha2::{Digest, Sha256};
+
+use crate::user_id::random_base32;
 
 /// A freshly minted key: the full string to hand out, plus what to store.
 pub struct MintedKey {
@@ -63,26 +65,10 @@ pub fn verify_secret(presented: &str, stored_hash: &str) -> bool {
     a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
-/// Draw `len` characters of Crockford base32 from the OS CSPRNG.
-fn random_base32(len: usize) -> Result<String> {
-    // One byte per character, reduced into the alphabet. Rejection sampling
-    // avoids the modulo bias that `byte % 32` would introduce... except 256
-    // is an exact multiple of 32, so the mask below is already uniform.
-    let mut bytes = vec![0u8; len.max(SECRET_ENTROPY_BYTES)];
-    getrandom::fill(&mut bytes)
-        .context("failed to read from the operating system CSPRNG while minting an API key")?;
-
-    Ok(bytes
-        .into_iter()
-        .take(len)
-        // 32 divides 256 exactly, so masking the low 5 bits is uniform.
-        .map(|b| ALPHABET[(b & 0b1_1111) as usize] as char)
-        .collect())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use fossdb::api_key::ALPHABET;
     use std::collections::HashSet;
 
     #[test]

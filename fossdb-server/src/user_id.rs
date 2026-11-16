@@ -6,45 +6,30 @@
 //! CSPRNG.
 
 use anyhow::{Context, Result};
-use fossdb::user_id::{ALPHABET, BODY_LEN, ENTROPY_BYTES, PREFIX};
+use fossdb::user_id::{ALPHABET, BODY_LEN, PREFIX};
 
-/// Mint a new account credential.
+/// Mint a new account credential: [`PREFIX`] followed by [`BODY_LEN`]
+/// random Crockford base32 characters (130 bits).
 ///
-/// Draws [`ENTROPY_BYTES`] (128 bits) from the operating system CSPRNG and
-/// renders it in Crockford base32. Errors rather than falling back to a
-/// weaker source: a predictable credential is a total account compromise, so
-/// failing the registration is strictly better than succeeding insecurely.
+/// Errors rather than falling back to a weaker source: a predictable
+/// credential is a total account compromise, so failing the registration is
+/// strictly better than succeeding insecurely.
 pub fn generate() -> Result<String> {
-    let mut entropy = [0u8; ENTROPY_BYTES];
-    getrandom::fill(&mut entropy).context(
-        "failed to read from the operating system CSPRNG while minting an account id",
-    )?;
+    Ok(format!("{PREFIX}{}", random_base32(BODY_LEN)?))
+}
 
-    let mut out = String::with_capacity(PREFIX.len() + BODY_LEN);
-    out.push_str(PREFIX);
+/// Draw `len` characters of Crockford base32 from the OS CSPRNG.
+///
+/// One byte per character, keeping the low 5 bits. 32 divides 256 exactly,
+/// so the mask is uniform and needs no rejection sampling.
+pub(crate) fn random_base32(len: usize) -> Result<String> {
+    let mut bytes = vec![0u8; len];
+    getrandom::fill(&mut bytes).context("failed to read from the operating system CSPRNG")?;
 
-    // Big-endian bit cursor over the entropy, emitting one alphabet symbol
-    // per 5 bits. 26 symbols x 5 = 130 bits, so the final symbol is padded
-    // with two zero bits; that costs nothing because the full 128 bits of
-    // entropy are still represented.
-    let mut acc: u16 = 0;
-    let mut bits: u8 = 0;
-    for byte in entropy {
-        acc = (acc << 8) | u16::from(byte);
-        bits += 8;
-        while bits >= 5 {
-            bits -= 5;
-            let symbol = ((acc >> bits) & 0b1_1111) as usize;
-            out.push(ALPHABET[symbol] as char);
-        }
-    }
-    if bits > 0 {
-        let symbol = ((acc << (5 - bits)) & 0b1_1111) as usize;
-        out.push(ALPHABET[symbol] as char);
-    }
-
-    debug_assert_eq!(out.len(), PREFIX.len() + BODY_LEN);
-    Ok(out)
+    Ok(bytes
+        .into_iter()
+        .map(|b| ALPHABET[(b & 0b1_1111) as usize] as char)
+        .collect())
 }
 
 #[cfg(test)]

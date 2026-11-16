@@ -6,7 +6,7 @@
 //! ```text
 //! fdb_3k9x7m2qdv5r8ptw1ny6az4cbf
 //! ^^^^ ^------------------------^
-//! |    26 chars of Crockford base32 (128 bits of entropy)
+//! |    26 chars of Crockford base32 (130 bits of entropy)
 //! prefix
 //! ```
 //!
@@ -30,8 +30,7 @@ pub const PREFIX: &str = "fdb_";
 
 /// Number of alphabet characters following the prefix.
 ///
-/// 26 chars x 5 bits = 130 bits of encoding space, carrying 128 bits of
-/// entropy.
+/// 26 chars x 5 bits = 130 bits of entropy.
 pub const BODY_LEN: usize = 26;
 
 /// Total length of a canonical id, prefix included.
@@ -39,9 +38,6 @@ pub const TOTAL_LEN: usize = PREFIX.len() + BODY_LEN;
 
 /// Crockford base32 digits, lowercase. Note the absence of `i`, `l`, `o`, `u`.
 pub const ALPHABET: &[u8; 32] = b"0123456789abcdefghjkmnpqrstvwxyz";
-
-/// Entropy backing one id.
-pub const ENTROPY_BYTES: usize = 16;
 
 /// Canonicalise user-supplied input.
 ///
