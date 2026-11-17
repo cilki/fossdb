@@ -189,6 +189,17 @@ impl ApiClient {
         .await
     }
 
+    /// Security advisories affecting any stored version of the package,
+    /// newest first.
+    pub async fn get_package_vulnerabilities(&self, id: &str) -> Result<Vec<PackageVulnerability>> {
+        self.request(
+            "GET",
+            &format!("/packages/{}/vulnerabilities", encode_uri_component(id)),
+            None,
+        )
+        .await
+    }
+
     pub async fn get_package_subscribers(&self, id: &str) -> Result<usize> {
         // The server returns `{package_id, package_name, subscriber_count}`.
         // Deserializing a non-optional `count` field that does not exist made

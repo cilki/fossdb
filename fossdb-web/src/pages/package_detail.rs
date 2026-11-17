@@ -1,6 +1,72 @@
-use crate::api::{types::*, ApiClient};
+use crate::api::{client::encode_uri_component, types::*, ApiClient};
 use crate::hooks::{use_auth, use_notifications};
 use dioxus::prelude::*;
+use std::collections::HashMap;
+
+/// One advisory as shown next to a version it affects.
+#[derive(Debug, Clone, PartialEq)]
+struct AdvisoryBadge {
+    source_id: String,
+    title: String,
+    severity: VulnerabilitySeverity,
+}
+
+fn severity_rank(severity: &VulnerabilitySeverity) -> u8 {
+    match severity {
+        VulnerabilitySeverity::Low => 0,
+        VulnerabilitySeverity::Medium => 1,
+        VulnerabilitySeverity::High => 2,
+        VulnerabilitySeverity::Critical => 3,
+    }
+}
+
+fn severity_classes(severity: &VulnerabilitySeverity) -> &'static str {
+    match severity {
+        VulnerabilitySeverity::Low => "bg-gray-600 text-gray-200",
+        VulnerabilitySeverity::Medium => "bg-yellow-900 text-yellow-300",
+        VulnerabilitySeverity::High => "bg-orange-900 text-orange-300",
+        VulnerabilitySeverity::Critical => "bg-red-900 text-red-300",
+    }
+}
+
+/// The advisories affecting each version, keyed by version string, most
+/// severe first (ties keep the server's newest-first order).
+fn advisories_by_version(
+    advisories: &[PackageVulnerability],
+) -> HashMap<String, Vec<AdvisoryBadge>> {
+    let mut by_version: HashMap<String, Vec<AdvisoryBadge>> = HashMap::new();
+    for advisory in advisories {
+        let v = &advisory.vulnerability;
+        for version in &advisory.affected_versions {
+            by_version
+                .entry(version.clone())
+                .or_default()
+                .push(AdvisoryBadge {
+                    source_id: v.source_id.clone(),
+                    title: v.title.clone(),
+                    severity: v.severity.clone(),
+                });
+        }
+    }
+    for badges in by_version.values_mut() {
+        // Stable, so equal severities stay newest first.
+        badges.sort_by_key(|b| std::cmp::Reverse(severity_rank(&b.severity)));
+    }
+    by_version
+}
+
+/// Where to read the full advisory. Ids from OSV (RustSec, GHSA, ...) have a
+/// page on osv.dev; rows imported before advisory ingestion carry a
+/// `fossdb-<id>` placeholder that names nothing outside FossDB.
+fn advisory_url(source_id: &str) -> Option<String> {
+    if source_id.is_empty() || source_id.starts_with("fossdb-") {
+        return None;
+    }
+    Some(format!(
+        "https://osv.dev/vulnerability/{}",
+        encode_uri_component(source_id)
+    ))
+}
 
 #[component]
 pub fn PackageDetail(id: String) -> Element {
@@ -9,6 +75,7 @@ pub fn PackageDetail(id: String) -> Element {
     let mut versions = use_signal(|| Vec::<PackageVersion>::new());
     let mut displayed_versions = use_signal(|| Vec::<PackageVersion>::new());
     let mut subscribers = use_signal(|| 0usize);
+    let mut advisories = use_signal(|| Vec::<PackageVulnerability>::new());
     let mut loading = use_signal(|| true);
     let mut is_subscribed = use_signal(|| false);
     let mut notifications_enabled = use_signal(|| false);
@@ -56,6 +123,15 @@ pub fn PackageDetail(id: String) -> Element {
                 }
             }
             current_page.set(0);
+
+            // Advisories are supplementary: if the request fails, the page
+            // still renders, just without badges.
+            advisories.set(
+                client
+                    .get_package_vulnerabilities(&pkg_id)
+                    .await
+                    .unwrap_or_default(),
+            );
 
             subscribers.set(client.get_package_subscribers(&pkg_id).await.unwrap_or(0));
 
@@ -190,6 +266,7 @@ pub fn PackageDetail(id: String) -> Element {
     };
 
     let total_pages = (versions().len() as f32 / page_size() as f32).ceil() as i32;
+    let badges = advisories_by_version(&advisories());
 
     rsx! {
         main { class: "min-h-screen bg-gray-900 py-12",
@@ -286,6 +363,18 @@ pub fn PackageDetail(id: String) -> Element {
                                                         "Released: {version.release_date.format(\"%Y-%m-%d\")}"
                                                     }
                                                 }
+                                                if let Some(affecting) = badges.get(&version.version) {
+                                                    div { class: "flex flex-wrap justify-end gap-2 ml-4",
+                                                        for badge in affecting.iter() {
+                                                            span {
+                                                                key: "{badge.source_id}",
+                                                                class: "px-2 py-1 rounded text-xs font-mono font-medium {severity_classes(&badge.severity)}",
+                                                                title: "{badge.severity:?}: {badge.title}",
+                                                                "{badge.source_id}"
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
 
@@ -315,6 +404,53 @@ pub fn PackageDetail(id: String) -> Element {
                                                 disabled: current_page() >= total_pages - 1,
                                                 onclick: next_page,
                                                 "Next"
+                                            }
+                                        }
+                                    }
+                                }
+
+                                if !advisories().is_empty() {
+                                    div { class: "bg-gray-800 rounded-2xl shadow-xl p-8 mt-6 border border-red-900",
+                                        h2 { class: "text-2xl font-bold text-gray-100 mb-6",
+                                            "Security Advisories ({advisories().len()})"
+                                        }
+                                        div { class: "space-y-4",
+                                            for advisory in advisories().iter() {
+                                                div {
+                                                    key: "{advisory.vulnerability.id}",
+                                                    class: "p-4 bg-gray-700 rounded-lg",
+                                                    div { class: "flex flex-wrap items-center gap-2 mb-2",
+                                                        span {
+                                                            class: "px-2 py-1 rounded text-xs font-medium {severity_classes(&advisory.vulnerability.severity)}",
+                                                            "{advisory.vulnerability.severity:?}"
+                                                        }
+                                                        if let Some(url) = advisory_url(&advisory.vulnerability.source_id) {
+                                                            a {
+                                                                href: "{url}",
+                                                                target: "_blank",
+                                                                rel: "noopener noreferrer",
+                                                                class: "font-mono text-sm text-blue-400 hover:text-blue-300",
+                                                                "{advisory.vulnerability.source_id}"
+                                                            }
+                                                        } else {
+                                                            span { class: "font-mono text-sm text-gray-300",
+                                                                "{advisory.vulnerability.source_id}"
+                                                            }
+                                                        }
+                                                        if let Some(cve) = &advisory.vulnerability.cve_id {
+                                                            span { class: "font-mono text-sm text-gray-400", "{cve}" }
+                                                        }
+                                                    }
+                                                    div { class: "font-semibold text-gray-100", "{advisory.vulnerability.title}" }
+                                                    div { class: "text-sm text-gray-400 mt-1",
+                                                        if !advisory.version_range.is_empty() {
+                                                            span { "Affected: {advisory.version_range}" }
+                                                        }
+                                                        if let Some(fixed) = &advisory.vulnerability.fixed_in {
+                                                            span { class: "ml-3", "Fixed in {fixed}" }
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                     }
@@ -393,5 +529,76 @@ pub fn PackageDetail(id: String) -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn advisory(
+        source_id: &str,
+        severity: VulnerabilitySeverity,
+        versions: &[&str],
+    ) -> PackageVulnerability {
+        PackageVulnerability {
+            vulnerability: Vulnerability {
+                id: 1,
+                source_id: source_id.into(),
+                cve_id: None,
+                title: format!("{source_id} title"),
+                description: String::new(),
+                severity,
+                affected_packages: Vec::new(),
+                discovered_at: Utc::now(),
+                fixed_in: None,
+            },
+            version_range: String::new(),
+            affected_versions: versions.iter().map(|v| v.to_string()).collect(),
+        }
+    }
+
+    fn ids(badges: &[AdvisoryBadge]) -> Vec<&str> {
+        badges.iter().map(|b| b.source_id.as_str()).collect()
+    }
+
+    #[test]
+    fn badges_are_grouped_by_version_most_severe_first() {
+        // Newest first, as the server returns them.
+        let advisories = [
+            advisory("RUSTSEC-2024-0003", VulnerabilitySeverity::Low, &["1.0.0"]),
+            advisory("RUSTSEC-2024-0002", VulnerabilitySeverity::Critical, &["1.0.0", "1.1.0"]),
+            advisory("RUSTSEC-2024-0001", VulnerabilitySeverity::Low, &["1.0.0"]),
+        ];
+
+        let by_version = advisories_by_version(&advisories);
+
+        assert_eq!(
+            ids(&by_version["1.0.0"]),
+            vec!["RUSTSEC-2024-0002", "RUSTSEC-2024-0003", "RUSTSEC-2024-0001"]
+        );
+        assert_eq!(ids(&by_version["1.1.0"]), vec!["RUSTSEC-2024-0002"]);
+        assert_eq!(by_version["1.1.0"][0].title, "RUSTSEC-2024-0002 title");
+        assert!(!by_version.contains_key("1.2.0"));
+    }
+
+    #[test]
+    fn only_published_ids_link_to_osv() {
+        assert_eq!(
+            advisory_url("RUSTSEC-2016-0001").as_deref(),
+            Some("https://osv.dev/vulnerability/RUSTSEC-2016-0001")
+        );
+        assert_eq!(
+            advisory_url("GHSA-34p9-f4q3-c4r7").as_deref(),
+            Some("https://osv.dev/vulnerability/GHSA-34p9-f4q3-c4r7")
+        );
+        // Ids are encoded rather than trusted as a path segment.
+        assert_eq!(
+            advisory_url("a/../b?c").as_deref(),
+            Some("https://osv.dev/vulnerability/a%2F..%2Fb%3Fc")
+        );
+        assert_eq!(advisory_url("fossdb-7"), None);
+        assert_eq!(advisory_url(""), None);
     }
 }
