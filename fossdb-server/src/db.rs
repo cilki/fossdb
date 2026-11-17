@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use crate::id_generator::IdGenerator;
 use crate::models::{
-    PackageKey, PackageVersionKey, TimelineEventKey, WorkerAnalysisKey,
+    PackageKey, PackageVersionKey, TimelineEventKey, VulnerabilityKey, WorkerAnalysisKey,
 };
-use crate::models::{ApiKey, WorkerAnalysis};
+use crate::models::{ApiKey, VulnerabilityV1, WorkerAnalysis};
 use crate::*;
 
 macro_rules! impl_insert {
@@ -92,6 +92,7 @@ static MODELS: Lazy<Models> = Lazy::new(|| {
     models.define::<Package>().unwrap();
     models.define::<PackageVersion>().unwrap();
     models.define::<User>().unwrap();
+    models.define::<VulnerabilityV1>().unwrap();
     models.define::<Vulnerability>().unwrap();
     models.define::<TimelineEvent>().unwrap();
     models.define::<WorkerAnalysis>().unwrap();
@@ -112,6 +113,12 @@ pub struct Database {
 impl Database {
     pub fn new(path: &str) -> Result<Self> {
         let db = Builder::new().create(&MODELS, path)?;
+
+        // Before the max-id scan below: until they are migrated, v1 rows are
+        // invisible to it, and the generator would reissue their ids.
+        let rw = db.rw_transaction()?;
+        rw.migrate::<Vulnerability>()?;
+        rw.commit()?;
 
         let r = db.r_transaction()?;
 
@@ -471,4 +478,145 @@ impl Database {
 
         Ok(delete_count)
     }
+
+    pub fn get_vulnerability_by_source_id(&self, source_id: &str) -> Result<Option<Vulnerability>> {
+        let r = self.db.r_transaction()?;
+        Ok(r.get().secondary(VulnerabilityKey::source_id, source_id)?)
+    }
+
+    /// Store an advisory, keyed by its `source_id`, and link it to versions.
+    ///
+    /// `vulnerability.id` is ignored: an advisory already stored under the
+    /// same `source_id` keeps its id and is overwritten, otherwise a new id
+    /// is assigned. `affected_versions` maps each affected package id to the
+    /// version strings the advisory names for it.
+    ///
+    /// Afterwards, a version of an affected package lists the vulnerability
+    /// in `PackageVersion::vulnerabilities` exactly when its version string
+    /// is in the map. Versions of packages that a previous copy of the
+    /// advisory named but this one no longer does are unlinked too, so a
+    /// corrected advisory does not leave stale links behind.
+    ///
+    /// Runs in one transaction, so concurrent ingests of the same advisory
+    /// cannot both create it.
+    pub fn upsert_advisory(
+        &self,
+        mut vulnerability: Vulnerability,
+        affected_versions: &std::collections::HashMap<u64, std::collections::HashSet<String>>,
+    ) -> Result<AdvisoryUpsert> {
+        let rw = self.db.rw_transaction()?;
+
+        let existing: Option<Vulnerability> = rw
+            .get()
+            .secondary(VulnerabilityKey::source_id, vulnerability.source_id.clone())?;
+
+        let mut packages: std::collections::BTreeSet<u64> =
+            affected_versions.keys().copied().collect();
+        match &existing {
+            Some(old) => {
+                vulnerability.id = old.id;
+                packages.extend(old.affected_packages.iter().map(|a| a.package_id));
+            }
+            None => vulnerability.id = self.vulnerability_ids.next(),
+        }
+        let id = vulnerability.id;
+        let tag = id.to_string();
+
+        let mut linked_versions = 0;
+        for package_id in packages {
+            let wanted = affected_versions.get(&package_id);
+            let versions: Vec<PackageVersion> = rw
+                .scan()
+                .secondary(PackageVersionKey::package_id)?
+                .start_with(package_id)?
+                .collect::<Result<Vec<_>, _>>()?;
+
+            for version in versions {
+                let should_link = wanted.is_some_and(|w| w.contains(&version.version));
+                let is_linked = version.vulnerabilities.contains(&tag);
+                if should_link {
+                    linked_versions += 1;
+                }
+                if should_link == is_linked {
+                    continue;
+                }
+
+                let mut updated = version.clone();
+                if should_link {
+                    updated.inner.vulnerabilities.push(tag.clone());
+                } else {
+                    updated.inner.vulnerabilities.retain(|v| v != &tag);
+                }
+                rw.remove(version)?;
+                rw.insert(updated)?;
+            }
+        }
+
+        let created = existing.is_none();
+        if let Some(old) = existing {
+            rw.remove(old)?;
+        }
+        rw.insert(vulnerability.clone())?;
+        rw.commit()?;
+
+        Ok(AdvisoryUpsert {
+            vulnerability,
+            created,
+            linked_versions,
+        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    /// A database written before `source_id` existed must open, keep its
+    /// rows, and not reissue their ids.
+    #[test]
+    fn v1_vulnerabilities_migrate_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+
+        {
+            let mut v1_only = Models::new();
+            v1_only.define::<VulnerabilityV1>().unwrap();
+            let db = Builder::new().create(&v1_only, &path).unwrap();
+            let rw = db.rw_transaction().unwrap();
+            rw.insert(VulnerabilityV1 {
+                id: 7,
+                cve_id: Some("CVE-2020-0001".into()),
+                title: "Old".into(),
+                description: "Imported before v2".into(),
+                severity: VulnerabilitySeverity::Low,
+                affected_packages: Vec::new(),
+                discovered_at: chrono::Utc::now(),
+                fixed_in: None,
+            })
+            .unwrap();
+            rw.commit().unwrap();
+        }
+
+        let db = Database::new(path.to_str().unwrap()).unwrap();
+
+        let migrated = db.get_vulnerability(7).unwrap().unwrap();
+        assert_eq!(migrated.source_id, "fossdb-7");
+        assert_eq!(migrated.cve_id.as_deref(), Some("CVE-2020-0001"));
+        assert_eq!(db.get_vulnerability_by_source_id("fossdb-7").unwrap().unwrap().id, 7);
+
+        let mut fresh = migrated.clone();
+        fresh.inner.source_id = "RUSTSEC-2024-0001".into();
+        let outcome = db.upsert_advisory(fresh, &HashMap::new()).unwrap();
+        assert!(outcome.created);
+        assert_eq!(outcome.vulnerability.id, 8);
+    }
+}
+
+/// Outcome of [`Database::upsert_advisory`].
+#[derive(Debug)]
+pub struct AdvisoryUpsert {
+    pub vulnerability: Vulnerability,
+    pub created: bool,
+    pub linked_versions: usize,
 }

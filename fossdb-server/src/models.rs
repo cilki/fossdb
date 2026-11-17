@@ -85,11 +85,46 @@ impl User {
 
 impl_deref!(User, fossdb::User);
 
+/// The version 1 `Vulnerability` row, kept only so that
+/// [`crate::db::Database::new`] can migrate it to version 2.
+///
+/// Field order must match what was encoded: rows are stored positionally.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(transparent)]
 #[native_model(id = 4, version = 1)]
 #[native_db(
     primary_key(id -> u64),
+)]
+pub struct VulnerabilityV1 {
+    pub id: u64,
+    pub cve_id: Option<String>,
+    pub title: String,
+    pub description: String,
+    pub severity: fossdb::VulnerabilitySeverity,
+    pub affected_packages: Vec<fossdb::AffectedPackage>,
+    pub discovered_at: chrono::DateTime<chrono::Utc>,
+    pub fixed_in: Option<String>,
+}
+
+impl VulnerabilityV1 {
+    fn id(&self) -> u64 {
+        self.id
+    }
+}
+
+/// `source_id` stand-in for a vulnerability that has no publisher id: v1 rows
+/// and imports from exports written before v2.
+pub fn legacy_source_id(id: u64) -> String {
+    format!("fossdb-{id}")
+}
+
+/// Version 2 adds the unique `source_id` key that advisories are upserted by.
+/// v1 rows migrate with [`legacy_source_id`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(transparent)]
+#[native_model(id = 4, version = 2, from = VulnerabilityV1)]
+#[native_db(
+    primary_key(id -> u64),
+    secondary_key(source_id -> String, unique),
 )]
 pub struct Vulnerability {
     pub inner: fossdb::Vulnerability,
@@ -98,6 +133,43 @@ pub struct Vulnerability {
 impl Vulnerability {
     fn id(&self) -> u64 {
         self.id
+    }
+    fn source_id(&self) -> String {
+        self.source_id.clone()
+    }
+}
+
+impl From<VulnerabilityV1> for Vulnerability {
+    fn from(v: VulnerabilityV1) -> Self {
+        Self {
+            inner: fossdb::Vulnerability {
+                id: v.id,
+                source_id: legacy_source_id(v.id),
+                cve_id: v.cve_id,
+                title: v.title,
+                description: v.description,
+                severity: v.severity,
+                affected_packages: v.affected_packages,
+                discovered_at: v.discovered_at,
+                fixed_in: v.fixed_in,
+            },
+        }
+    }
+}
+
+impl From<Vulnerability> for VulnerabilityV1 {
+    fn from(v: Vulnerability) -> Self {
+        let v = v.inner;
+        Self {
+            id: v.id,
+            cve_id: v.cve_id,
+            title: v.title,
+            description: v.description,
+            severity: v.severity,
+            affected_packages: v.affected_packages,
+            discovered_at: v.discovered_at,
+            fixed_in: v.fixed_in,
+        }
     }
 }
 

@@ -193,6 +193,7 @@ async fn start_server(config: Config) -> Result<()> {
         .route("/packages", get(handlers::collector::get_package))
         .route("/packages", post(handlers::collector::upsert_package))
         .route("/packages/{name}/timestamp", put(handlers::collector::update_package_timestamp))
+        .route("/advisories", post(handlers::collector::upsert_advisory))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::collector_auth_middleware,
@@ -410,7 +411,13 @@ async fn import_database(config: &Config, input: PathBuf, merge: bool) -> Result
             eprintln!("\n✓ Imported {} users ({} skipped)", total - skipped, skipped);
         }
         "vulnerabilities" => {
-            let data: Vec<Vulnerability> = serde_json::from_str(&json)?;
+            let mut data: Vec<Vulnerability> = serde_json::from_str(&json)?;
+            // Exports written before `source_id` existed lack it.
+            for v in &mut data {
+                if v.source_id.is_empty() {
+                    v.inner.source_id = fossdb_server::models::legacy_source_id(v.id);
+                }
+            }
             import_with_progress!(data, "vulnerabilities", get_vulnerability, insert_vulnerability);
         }
         "timeline_events" => {

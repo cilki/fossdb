@@ -150,6 +150,14 @@ pub struct User {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Vulnerability {
     pub id: u64,
+    /// Identifier assigned by the advisory's publisher, e.g.
+    /// `RUSTSEC-2024-0001` or `GHSA-xxxx-xxxx-xxxx`. Unique, and the key an
+    /// advisory is upserted by, so ingesting the same advisory twice updates
+    /// one row instead of creating two.
+    ///
+    /// Rows that predate advisory ingestion carry `fossdb-<id>`.
+    #[serde(default)]
+    pub source_id: String,
     pub cve_id: Option<String>,
     pub title: String,
     pub description: String,
@@ -338,6 +346,64 @@ pub struct CollectedVersion {
     pub checksum: Option<String>,
     pub dependencies: Vec<Dependency>,
     pub changelog: Option<String>,
+}
+
+/// A published security advisory, as sent by a collector to
+/// `POST /advisories`.
+///
+/// The shape follows OSV (<https://ossf.github.io/osv-schema/>), but nothing
+/// here is OSV-specific: any source that can name the affected versions can
+/// produce one.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectedAdvisory {
+    /// The publisher's identifier (OSV `id`). The upsert key.
+    pub source_id: String,
+    /// Other identifiers for the same advisory (OSV `aliases`). The first
+    /// `CVE-` entry becomes [`Vulnerability::cve_id`].
+    pub aliases: Vec<String>,
+    /// OSV `summary`.
+    pub title: String,
+    /// OSV `details`.
+    pub description: String,
+    pub severity: VulnerabilitySeverity,
+    /// OSV `published`. Stored as [`Vulnerability::discovered_at`].
+    pub published: DateTime<Utc>,
+    pub affected: Vec<CollectedAffected>,
+}
+
+/// One package an advisory applies to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectedAffected {
+    pub package_name: String,
+    /// Must equal the stored [`Package::platform`] (ignoring ASCII case) for
+    /// the entry to be linked. Package names are only unique per ecosystem,
+    /// so matching on the name alone could attach a crates.io advisory to an
+    /// unrelated npm package that happens to share the name.
+    pub platform: String,
+    /// Every affected version, already enumerated by the source (OSV
+    /// `versions`). The server matches these against stored versions
+    /// verbatim, so it needs no ecosystem-specific version parser.
+    pub affected_versions: Vec<String>,
+    /// Human-readable affected ranges, e.g. `>=0, <1.2.3`. For display only.
+    pub ranges: Vec<String>,
+    pub fixed_in: Option<String>,
+}
+
+/// Response to `POST /advisories`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdvisoryIngestResult {
+    /// The stored vulnerability, or `None` if the advisory named no package
+    /// FossDB tracks and so was not stored.
+    pub vulnerability_id: Option<u64>,
+    /// True if this request created the vulnerability rather than updating it.
+    pub created: bool,
+    /// Packages the advisory was linked to.
+    pub linked_packages: usize,
+    /// Stored versions that now list this vulnerability.
+    pub linked_versions: usize,
+    /// `affected` entries that matched no stored package, as
+    /// `platform/name`, so the collector can log the gap.
+    pub skipped: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
