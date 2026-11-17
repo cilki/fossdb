@@ -523,6 +523,7 @@ impl Database {
         let tag = id.to_string();
 
         let mut linked_versions = 0;
+        let mut newly_linked: std::collections::BTreeMap<u64, Vec<String>> = Default::default();
         for package_id in packages {
             let wanted = affected_versions.get(&package_id);
             let versions: Vec<PackageVersion> = rw
@@ -544,25 +545,31 @@ impl Database {
                 let mut updated = version.clone();
                 if should_link {
                     updated.inner.vulnerabilities.push(tag.clone());
+                    newly_linked
+                        .entry(package_id)
+                        .or_default()
+                        .push(version.version.clone());
                 } else {
                     updated.inner.vulnerabilities.retain(|v| v != &tag);
                 }
-                rw.remove(version)?;
-                rw.insert(updated)?;
+                // `update`, not `remove` + `insert`: watchers would see the
+                // latter as a brand-new version and announce a release.
+                rw.update(version, updated)?;
             }
         }
 
         let created = existing.is_none();
-        if let Some(old) = existing {
-            rw.remove(old)?;
+        match existing {
+            Some(old) => rw.update(old, vulnerability.clone())?,
+            None => rw.insert(vulnerability.clone())?,
         }
-        rw.insert(vulnerability.clone())?;
         rw.commit()?;
 
         Ok(AdvisoryUpsert {
             vulnerability,
             created,
             linked_versions,
+            newly_linked,
         })
     }
 }
@@ -619,4 +626,8 @@ pub struct AdvisoryUpsert {
     pub vulnerability: Vulnerability,
     pub created: bool,
     pub linked_versions: usize,
+    /// Versions, by package id, that this call linked and that did not list
+    /// the vulnerability before. Empty when re-ingesting an unchanged
+    /// advisory, so callers can alert on exactly what is new.
+    pub newly_linked: std::collections::BTreeMap<u64, Vec<String>>,
 }

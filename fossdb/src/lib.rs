@@ -406,6 +406,19 @@ pub struct AdvisoryIngestResult {
     pub skipped: Vec<String>,
 }
 
+/// One advisory as it applies to a single package, returned by
+/// `GET /api/packages/{id}/vulnerabilities`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PackageVulnerability {
+    #[serde(flatten)]
+    pub vulnerability: Vulnerability,
+    /// The advisory's affected range for this package, for display, e.g.
+    /// `>=0.10.0, <0.10.2`.
+    pub version_range: String,
+    /// Stored versions of this package the advisory is linked to.
+    pub affected_versions: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PackageLookup {
     pub package: Package,

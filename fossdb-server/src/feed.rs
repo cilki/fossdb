@@ -51,6 +51,9 @@ fn entry_id(event: &TimelineEvent) -> String {
 }
 
 fn entry_title(event: &TimelineEvent) -> String {
+    if event.event_type == crate::EventType::SecurityAlert {
+        return format!("Security advisory for {}", event.package_name);
+    }
     match &event.version {
         Some(version) => format!("{} {}", event.package_name, version),
         None => event.package_name.clone(),
@@ -220,6 +223,19 @@ mod tests {
                 .contains("https://fossdb.example/feed/fdb_3k9x7m2qdv5r8ptw1ny6az4cbf/atom.xml")
         );
         assert_eq!(feed.content_type, "application/atom+xml; charset=utf-8");
+    }
+
+    #[test]
+    fn security_alerts_are_titled_as_such() {
+        let mut alert = event(1, "openssl", "unused", 1);
+        alert.inner.event_type = EventType::SecurityAlert;
+        alert.inner.version = None;
+        alert.inner.message = "RUSTSEC-2016-0001 (High): MitM. Affects 0.8.3.".into();
+
+        let feed = render_atom(&ctx(std::slice::from_ref(&alert)));
+
+        assert!(feed.body.contains("<title>Security advisory for openssl</title>"), "{}", feed.body);
+        assert!(feed.body.contains("RUSTSEC-2016-0001 (High): MitM. Affects 0.8.3."));
     }
 
     #[test]

@@ -12,6 +12,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::AppState;
 use crate::db::Database;
+use crate::db_listener::emit_security_alerts;
+use crate::websocket::TimelineBroadcaster;
 use crate::{Package, PackageVersion, Vulnerability};
 
 #[derive(Deserialize)]
@@ -146,7 +148,7 @@ pub async fn upsert_advisory(
         return Err(StatusCode::UNPROCESSABLE_ENTITY);
     }
     let source_id = advisory.source_id.clone();
-    ingest_advisory(&state.db, advisory).map(Json).map_err(|e| {
+    ingest_advisory(&state.db, &state.broadcaster, advisory).map(Json).map_err(|e| {
         tracing::error!("Failed to ingest advisory {}: {}", source_id, e);
         StatusCode::INTERNAL_SERVER_ERROR
     })
@@ -158,8 +160,13 @@ pub async fn upsert_advisory(
 /// different platform, are skipped and reported back. An advisory none of
 /// whose entries resolve is not stored at all, unless an earlier copy of it
 /// was: then it is still updated, so the links that copy made are removed.
+///
+/// Versions the advisory is newly linked to raise `SecurityAlert` events
+/// for their package's subscribers; see
+/// [`crate::db_listener::emit_security_alerts`].
 pub fn ingest_advisory(
     db: &Database,
+    broadcaster: &TimelineBroadcaster,
     advisory: CollectedAdvisory,
 ) -> anyhow::Result<AdvisoryIngestResult> {
     struct Matched {
@@ -262,6 +269,7 @@ pub fn ingest_advisory(
     if outcome.created {
         tracing::info!("New advisory: {}", outcome.vulnerability.source_id);
     }
+    emit_security_alerts(db, broadcaster, &outcome.vulnerability, &outcome.newly_linked);
 
     Ok(AdvisoryIngestResult {
         vulnerability_id: Some(outcome.vulnerability.id),
@@ -387,7 +395,7 @@ mod tests {
         let (_dir, db) = open_db();
         let pkg = add_package(&db, "smallvec", "crates.io", &["1.0.0", "1.1.0", "1.2.0"]);
 
-        let result = ingest_advisory(&db, advisory("smallvec", "crates.io", &["1.0.0", "1.1.0"])).unwrap();
+        let result = ingest_advisory(&db, &TimelineBroadcaster::new(), advisory("smallvec", "crates.io", &["1.0.0", "1.1.0"])).unwrap();
 
         let id = result.vulnerability_id.unwrap();
         assert!(result.created);
@@ -415,10 +423,10 @@ mod tests {
         let (_dir, db) = open_db();
         let pkg = add_package(&db, "smallvec", "crates.io", &["1.0.0"]);
 
-        let first = ingest_advisory(&db, advisory("smallvec", "crates.io", &["1.0.0"])).unwrap();
+        let first = ingest_advisory(&db, &TimelineBroadcaster::new(), advisory("smallvec", "crates.io", &["1.0.0"])).unwrap();
         let mut again = advisory("smallvec", "crates.io", &["1.0.0"]);
         again.title = "Memory corruption (revised)".into();
-        let second = ingest_advisory(&db, again).unwrap();
+        let second = ingest_advisory(&db, &TimelineBroadcaster::new(), again).unwrap();
 
         assert!(first.created);
         assert!(!second.created);
@@ -445,10 +453,10 @@ mod tests {
             ranges: Vec::new(),
             fixed_in: None,
         });
-        ingest_advisory(&db, first).unwrap();
+        ingest_advisory(&db, &TimelineBroadcaster::new(), first).unwrap();
 
         // The publisher narrows the advisory: one version, one package.
-        let revised = ingest_advisory(&db, advisory("smallvec", "crates.io", &["1.0.0"])).unwrap();
+        let revised = ingest_advisory(&db, &TimelineBroadcaster::new(), advisory("smallvec", "crates.io", &["1.0.0"])).unwrap();
 
         assert_eq!(revised.linked_versions, 1);
         assert_eq!(links(&db, pkg)["1.0.0"].len(), 1);
@@ -465,7 +473,7 @@ mod tests {
         let (_dir, db) = open_db();
         let pkg = add_package(&db, "left-pad", "NPM", &["1.0.0"]);
 
-        let result = ingest_advisory(&db, advisory("left-pad", "crates.io", &["1.0.0"])).unwrap();
+        let result = ingest_advisory(&db, &TimelineBroadcaster::new(), advisory("left-pad", "crates.io", &["1.0.0"])).unwrap();
 
         assert_eq!(result.vulnerability_id, None);
         assert_eq!(result.skipped, vec!["crates.io/left-pad".to_string()]);
@@ -478,16 +486,149 @@ mod tests {
         let (_dir, db) = open_db();
         add_package(&db, "left-pad", "NPM", &["1.0.0"]);
 
-        let result = ingest_advisory(&db, advisory("left-pad", "npm", &["1.0.0"])).unwrap();
+        let result = ingest_advisory(&db, &TimelineBroadcaster::new(), advisory("left-pad", "npm", &["1.0.0"])).unwrap();
 
         assert_eq!(result.linked_versions, 1);
+    }
+
+    fn subscribe(db: &Database, user_id: &str, package: &str) {
+        db.insert_user(crate::User {
+            inner: fossdb::User {
+                user_id: user_id.into(),
+                subscriptions: vec![fossdb::PackageSubscription {
+                    package_name: package.into(),
+                    notifications_enabled: true,
+                }],
+                created_at: Utc::now(),
+                notifications_enabled: true,
+            },
+        })
+        .unwrap();
+    }
+
+    fn alerts(db: &Database, user_id: &str) -> Vec<fossdb::TimelineEvent> {
+        db.get_timeline_events_by_user(user_id)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.inner)
+            .filter(|e| e.event_type == fossdb::EventType::SecurityAlert)
+            .collect()
+    }
+
+    #[test]
+    fn new_links_alert_subscribers_once() {
+        let (_dir, db) = open_db();
+        let broadcaster = TimelineBroadcaster::new();
+        let pkg = add_package(&db, "smallvec", "crates.io", &["1.0.0", "1.1.0", "1.2.0"]);
+        add_package(&db, "tinyvec", "crates.io", &["0.1.0"]);
+        subscribe(&db, "subscriber", "smallvec");
+        subscribe(&db, "bystander", "tinyvec");
+
+        let result =
+            ingest_advisory(&db, &broadcaster, advisory("smallvec", "crates.io", &["1.0.0", "1.1.0"]))
+                .unwrap();
+
+        let events = alerts(&db, "subscriber");
+        assert_eq!(events.len(), 1, "one alert per advisory, not per version");
+        let event = &events[0];
+        assert_eq!(event.package_id, pkg);
+        assert_eq!(event.package_name, "smallvec");
+        assert_eq!(
+            event.message,
+            "RUSTSEC-2024-0001 (High): Memory corruption. Affects 1.0.0, 1.1.0. Fixed in 1.2.0."
+        );
+        let metadata: serde_json::Value =
+            serde_json::from_str(event.metadata.as_deref().unwrap()).unwrap();
+        assert_eq!(metadata["vulnerability_id"], result.vulnerability_id.unwrap());
+        assert_eq!(metadata["source_id"], "RUSTSEC-2024-0001");
+        assert_eq!(metadata["versions"], serde_json::json!(["1.0.0", "1.1.0"]));
+        assert!(alerts(&db, "bystander").is_empty());
+
+        // Re-ingesting the same advisory links nothing new.
+        ingest_advisory(&db, &broadcaster, advisory("smallvec", "crates.io", &["1.0.0", "1.1.0"]))
+            .unwrap();
+        assert_eq!(alerts(&db, "subscriber").len(), 1);
+
+        // A revision that widens the advisory alerts on the added version only.
+        ingest_advisory(
+            &db,
+            &broadcaster,
+            advisory("smallvec", "crates.io", &["1.0.0", "1.1.0", "1.2.0"]),
+        )
+        .unwrap();
+        let events = alerts(&db, "subscriber");
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|e| e.message.contains("Affects 1.2.0.")));
+    }
+
+    /// Linking a version used to remove and re-insert its row, which the
+    /// `PackageVersion` watch took for a new release.
+    #[test]
+    fn linking_versions_does_not_look_like_a_release() {
+        let (_dir, db) = open_db();
+        add_package(&db, "smallvec", "crates.io", &["1.0.0", "1.1.0"]);
+        let (recv, _id) = db.db.watch().scan().primary().all::<PackageVersion>().unwrap();
+
+        ingest_advisory(
+            &db,
+            &TimelineBroadcaster::new(),
+            advisory("smallvec", "crates.io", &["1.0.0", "1.1.0"]),
+        )
+        .unwrap();
+        // And unlinking one again.
+        ingest_advisory(
+            &db,
+            &TimelineBroadcaster::new(),
+            advisory("smallvec", "crates.io", &["1.0.0"]),
+        )
+        .unwrap();
+
+        let events: Vec<_> = recv.try_iter().collect();
+        assert_eq!(events.len(), 3);
+        assert!(
+            events.iter().all(|e| matches!(e, native_db::watch::Event::Update(_))),
+            "{events:?}"
+        );
+    }
+
+    #[test]
+    fn package_vulnerabilities_lists_linked_versions() {
+        use crate::handlers::packages::package_vulnerabilities;
+
+        let (_dir, db) = open_db();
+        let broadcaster = TimelineBroadcaster::new();
+        let pkg = add_package(&db, "smallvec", "crates.io", &["1.0.0", "1.1.0", "1.2.0"]);
+        let other = add_package(&db, "tinyvec", "crates.io", &["0.1.0"]);
+
+        let mut older = advisory("smallvec", "crates.io", &["1.0.0"]);
+        older.source_id = "RUSTSEC-2020-0001".into();
+        older.published = Utc::now() - chrono::Duration::days(365);
+        ingest_advisory(&db, &broadcaster, older).unwrap();
+        ingest_advisory(&db, &broadcaster, advisory("smallvec", "crates.io", &["1.0.0", "1.1.0"]))
+            .unwrap();
+
+        let list = package_vulnerabilities(&db, pkg).unwrap().unwrap();
+        assert_eq!(list.len(), 2);
+        assert_eq!(list[0].vulnerability.source_id, "RUSTSEC-2024-0001", "newest first");
+        assert_eq!(list[0].affected_versions, vec!["1.0.0", "1.1.0"]);
+        assert_eq!(list[0].version_range, ">=0, <1.2.0");
+        assert_eq!(list[1].vulnerability.source_id, "RUSTSEC-2020-0001");
+        assert_eq!(list[1].affected_versions, vec!["1.0.0"]);
+
+        // Flattened on the wire, so clients see the advisory's own fields.
+        let json = serde_json::to_value(&list[0]).unwrap();
+        assert_eq!(json["source_id"], "RUSTSEC-2024-0001");
+        assert_eq!(json["affected_versions"], serde_json::json!(["1.0.0", "1.1.0"]));
+
+        assert!(package_vulnerabilities(&db, other).unwrap().unwrap().is_empty());
+        assert!(package_vulnerabilities(&db, 9999).unwrap().is_none());
     }
 
     #[test]
     fn unknown_package_is_skipped_and_not_stored() {
         let (_dir, db) = open_db();
 
-        let result = ingest_advisory(&db, advisory("nonexistent", "crates.io", &["1.0.0"])).unwrap();
+        let result = ingest_advisory(&db, &TimelineBroadcaster::new(), advisory("nonexistent", "crates.io", &["1.0.0"])).unwrap();
 
         assert_eq!(result.vulnerability_id, None);
         assert_eq!(result.skipped, vec!["crates.io/nonexistent".to_string()]);

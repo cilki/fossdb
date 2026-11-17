@@ -4,9 +4,11 @@ use axum::{
     response::Json,
 };
 use chrono::Utc;
+use fossdb::PackageVulnerability;
 use serde::Deserialize;
 use serde_json::Value;
 
+use crate::db::Database;
 use crate::{AppState, Package, PackageVersion, CreatePackageRequest};
 
 #[derive(Debug, Deserialize)]
@@ -169,6 +171,60 @@ pub async fn get_package_versions(
         Ok(versions) => Ok(Json(versions)),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+pub async fn get_package_vulnerabilities(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<Vec<PackageVulnerability>>, StatusCode> {
+    let id = id.parse::<u64>().map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    match package_vulnerabilities(&state.db, id) {
+        Ok(Some(list)) => Ok(Json(list)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => {
+            tracing::error!("Failed to list vulnerabilities of package {}: {}", id, e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// Advisories affecting any version of a package, most recently published
+/// first, or `None` if there is no such package.
+pub fn package_vulnerabilities(
+    db: &Database,
+    package_id: u64,
+) -> anyhow::Result<Option<Vec<PackageVulnerability>>> {
+    if db.get_package(package_id)?.is_none() {
+        return Ok(None);
+    }
+    let versions = db.get_versions_by_package(package_id)?;
+
+    let mut list: Vec<PackageVulnerability> = db
+        .get_all_vulnerabilities()?
+        .into_iter()
+        .filter_map(|v| {
+            let version_range = v
+                .affected_packages
+                .iter()
+                .find(|a| a.package_id == package_id)?
+                .version_range
+                .clone();
+            let tag = v.id.to_string();
+            let affected_versions = versions
+                .iter()
+                .filter(|pv| pv.vulnerabilities.contains(&tag))
+                .map(|pv| pv.version.clone())
+                .collect();
+            Some(PackageVulnerability {
+                vulnerability: v.inner,
+                version_range,
+                affected_versions,
+            })
+        })
+        .collect();
+    list.sort_by(|a, b| b.vulnerability.discovered_at.cmp(&a.vulnerability.discovered_at));
+    Ok(Some(list))
 }
 
 pub async fn get_package_subscriber_count(
