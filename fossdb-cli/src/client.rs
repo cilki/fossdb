@@ -49,21 +49,27 @@ impl Client {
     ///
     /// The status is translated into something actionable: a bare "401
     /// Unauthorized" tells a user nothing about what to do next.
+    ///
+    /// A 404 means something different on every endpoint (an unknown package,
+    /// a package the account is not subscribed to, ...), so the caller says
+    /// what it means for this request.
     async fn decode<T: serde::de::DeserializeOwned>(
         &self,
         response: reqwest::Response,
         what: &str,
+        not_found: &str,
     ) -> Result<T> {
         let status = response.status();
 
         if !status.is_success() {
             let body = response.unwrap_or_default_text().await;
 
+            let not_found = format!(" - {not_found}");
             let hint = match status.as_u16() {
                 401 => " - the stored account id was rejected; it may have been purged \
                          (accounts with no subscriptions are deleted automatically). \
                          Run `fossdb login` again or `fossdb register` for a new account.",
-                404 => " - not found",
+                404 => not_found.as_str(),
                 429 => " - rate limited; try again shortly",
                 500..=599 => " - the server reported an internal error",
                 _ => "",
@@ -90,7 +96,8 @@ impl Client {
             .await
             .with_context(|| format!("connecting to {}", self.server))?;
 
-        self.decode(response, "registration").await
+        self.decode(response, "registration", "this server has no such endpoint; check that --server/FOSSDB_SERVER points at a FossDB server")
+            .await
     }
 
     /// Confirm a credential names a live account.
@@ -105,7 +112,7 @@ impl Client {
             .await
             .with_context(|| format!("connecting to {}", self.server))?;
 
-        self.decode(response, "login").await
+        self.decode(response, "login", "this server has no such endpoint; check that --server/FOSSDB_SERVER points at a FossDB server").await
     }
 
     pub async fn subscriptions(&self) -> Result<Vec<PackageSubscription>> {
@@ -115,7 +122,13 @@ impl Client {
             .await
             .with_context(|| format!("connecting to {}", self.server))?;
 
-        let body: SubscriptionResponse = self.decode(response, "fetching subscriptions").await?;
+        let body: SubscriptionResponse = self
+            .decode(
+                response,
+                "fetching subscriptions",
+                "the account no longer exists; run `fossdb register` for a new one",
+            )
+            .await?;
         Ok(body.subscriptions)
     }
 
@@ -130,7 +143,14 @@ impl Client {
             .with_context(|| format!("connecting to {}", self.server))?;
 
         let body: SubscriptionResponse = self
-            .decode(response, format!("subscribing to {package_name}").as_str())
+            .decode(
+                response,
+                &format!("subscribing to {package_name}"),
+                &format!(
+                    "this server knows no package named `{package_name}` \
+                     (names must match exactly, including case)"
+                ),
+            )
             .await?;
         Ok(body.subscriptions)
     }
@@ -153,7 +173,8 @@ impl Client {
         let body: SubscriptionResponse = self
             .decode(
                 response,
-                format!("unsubscribing from {package_name}").as_str(),
+                &format!("unsubscribing from {package_name}"),
+                &not_subscribed(package_name),
             )
             .await?;
         Ok(body.subscriptions)
@@ -176,10 +197,22 @@ impl Client {
             .with_context(|| format!("connecting to {}", self.server))?;
 
         let body: SubscriptionResponse = self
-            .decode(response, "updating notification setting")
+            .decode(
+                response,
+                &format!("updating notifications for {package_name}"),
+                &not_subscribed(package_name),
+            )
             .await?;
         Ok(body.subscriptions)
     }
+}
+
+/// Explanation for an operation on a package the account does not follow.
+pub fn not_subscribed(package_name: &str) -> String {
+    format!(
+        "this account is not subscribed to `{package_name}`; \
+         run `fossdb subscriptions` to list the packages it follows"
+    )
 }
 
 /// Percent-encode one URL path segment.
