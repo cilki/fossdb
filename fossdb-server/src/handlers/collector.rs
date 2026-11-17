@@ -12,7 +12,8 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::AppState;
 use crate::db::Database;
-use crate::db_listener::emit_security_alerts;
+use crate::db_listener::{emit_lookalike_alert, emit_security_alerts};
+use crate::lookalike::LookalikeTargets;
 use crate::websocket::TimelineBroadcaster;
 use crate::{Package, PackageVersion, Vulnerability};
 
@@ -47,17 +48,33 @@ pub async fn upsert_package(
     State(state): State<AppState>,
     Json(collected): Json<CollectedPackage>,
 ) -> Result<Json<fossdb::Package>, StatusCode> {
+    store_package(&state.db, &state.broadcaster, &state.lookalikes, collected)
+        .map(Json)
+        .map_err(|e| {
+            tracing::error!("Failed to store package: {}", e);
+            StatusCode::INTERNAL_SERVER_ERROR
+        })
+}
+
+/// Insert a package, or add the versions of an already stored one that are
+/// new.
+///
+/// A package new to the database is checked against the popular names of
+/// its ecosystem; if it imitates one, that package's subscribers get a
+/// `SecurityAlert` (see [`crate::db_listener::emit_lookalike_alert`]).
+pub fn store_package(
+    db: &Database,
+    broadcaster: &TimelineBroadcaster,
+    lookalikes: &LookalikeTargets,
+    collected: CollectedPackage,
+) -> anyhow::Result<fossdb::Package> {
     let now = Utc::now();
 
-    let existing = state.db.get_package_by_name(&collected.name).map_err(|e| {
-        tracing::error!("DB error checking package: {}", e);
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
+    let existing = db.get_package_by_name(&collected.name)?;
 
     let (package, known_versions) = match existing {
         Some(existing) => {
-            let known: HashSet<String> = state
-                .db
+            let known: HashSet<String> = db
                 .get_versions_by_package(existing.id)
                 .unwrap_or_default()
                 .into_iter()
@@ -84,11 +101,14 @@ pub async fn upsert_package(
                     rank: collected.rank,
                 },
             };
-            let saved = state.db.insert_package(package).map_err(|e| {
-                tracing::error!("Failed to insert package: {}", e);
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+            let saved = db.insert_package(package)?;
             tracing::info!("Saved new package: {}", saved.name);
+            // A failed check must not fail the ingest; the package is stored.
+            match lookalikes.check(db, &saved) {
+                Ok(Some(lookalike)) => emit_lookalike_alert(db, broadcaster, &saved, &lookalike),
+                Ok(None) => {}
+                Err(e) => tracing::error!("Lookalike check for {} failed: {}", saved.name, e),
+            }
             (saved, HashSet::new())
         }
     };
@@ -112,12 +132,12 @@ pub async fn upsert_package(
                 created_at: now,
             },
         };
-        if let Err(e) = state.db.insert_version(version) {
+        if let Err(e) = db.insert_version(version) {
             tracing::error!("Failed to insert version: {}", e);
         }
     }
 
-    Ok(Json(package.inner))
+    Ok(package.inner)
 }
 
 pub async fn upsert_advisory(
@@ -292,6 +312,7 @@ pub async fn update_package_timestamp(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lookalike::MIN_TARGET_POPULARITY;
     use fossdb::{CollectedAffected, VulnerabilitySeverity};
 
     fn open_db() -> (tempfile::TempDir, Database) {
@@ -602,6 +623,164 @@ mod tests {
 
         assert!(package_vulnerabilities(&db, other).unwrap().unwrap().is_empty());
         assert!(package_vulnerabilities(&db, 9999).unwrap().is_none());
+    }
+
+    fn collected(
+        name: &str,
+        platform: &str,
+        dependents_count: Option<u32>,
+        depends_on: &[&str],
+    ) -> CollectedPackage {
+        CollectedPackage {
+            name: name.into(),
+            description: None,
+            homepage: None,
+            repository: None,
+            license: None,
+            tags: Vec::new(),
+            versions: vec![fossdb::CollectedVersion {
+                version: "1.0.0".into(),
+                release_date: Utc::now(),
+                download_url: None,
+                checksum: None,
+                dependencies: depends_on
+                    .iter()
+                    .map(|d| fossdb::Dependency {
+                        name: (*d).into(),
+                        version_requirement: "*".into(),
+                        dependency_type: "normal".into(),
+                        optional: false,
+                    })
+                    .collect(),
+                changelog: None,
+            }],
+            platform: Some(platform.into()),
+            language: None,
+            status: None,
+            dependents_count,
+            rank: None,
+        }
+    }
+
+    /// Store packages that existed before the test's lookalike cache was
+    /// built, so they do not go through (or warm) that cache.
+    fn seed(db: &Database, packages: Vec<CollectedPackage>) {
+        for p in packages {
+            store_package(db, &TimelineBroadcaster::new(), &LookalikeTargets::new(), p).unwrap();
+        }
+    }
+
+    #[test]
+    fn lookalike_alerts_the_imitated_packages_subscribers_once() {
+        let (_dir, db) = open_db();
+        let broadcaster = TimelineBroadcaster::new();
+        seed(
+            &db,
+            vec![
+                collected("colorama", "Pypi", Some(5000), &[]),
+                collected("requests", "Pypi", Some(9000), &[]),
+            ],
+        );
+        let colorama = db.get_package_by_name("colorama").unwrap().unwrap().id;
+        subscribe(&db, "subscriber", "colorama");
+        subscribe(&db, "bystander", "requests");
+        let lookalikes = LookalikeTargets::new();
+
+        let squat = store_package(
+            &db,
+            &broadcaster,
+            &lookalikes,
+            collected("colourama", "Pypi", Some(0), &[]),
+        )
+        .unwrap();
+
+        let events = alerts(&db, "subscriber");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.package_id, colorama);
+        assert_eq!(event.package_name, "colorama");
+        assert_eq!(
+            event.message,
+            "New Pypi package colourama closely resembles colorama (one character different). \
+             Check your manifests."
+        );
+        let metadata: serde_json::Value =
+            serde_json::from_str(event.metadata.as_deref().unwrap()).unwrap();
+        assert_eq!(metadata["lookalike_package_id"], squat.id);
+        assert_eq!(metadata["lookalike_name"], "colourama");
+        assert_eq!(metadata["reason"], "Edit1");
+        assert_eq!(metadata["severity"], "Medium");
+        assert!(alerts(&db, "bystander").is_empty());
+
+        // Collectors re-send known packages on every run; only arrival alerts.
+        let mut again = collected("colourama", "Pypi", Some(0), &[]);
+        again.versions[0].version = "1.0.1".into();
+        store_package(&db, &broadcaster, &lookalikes, again).unwrap();
+        assert_eq!(alerts(&db, "subscriber").len(), 1);
+    }
+
+    #[test]
+    fn popular_or_unrelated_newcomers_are_not_flagged() {
+        let (_dir, db) = open_db();
+        seed(&db, vec![collected("colorama", "Pypi", Some(5000), &[])]);
+        subscribe(&db, "subscriber", "colorama");
+        let lookalikes = LookalikeTargets::new();
+        let store = |p| store_package(&db, &TimelineBroadcaster::new(), &lookalikes, p).unwrap();
+
+        // Popular enough to be a target itself: an established neighbour.
+        store(collected("colourama", "Pypi", Some(MIN_TARGET_POPULARITY), &[]));
+        // Same name under PEP 503 normalisation: the same PyPI project.
+        store(collected("Colorama", "Pypi", Some(0), &[]));
+        // A different ecosystem.
+        store(collected("colorana", "NPM", Some(0), &[]));
+        store(collected("termcolor", "Pypi", Some(0), &[]));
+
+        assert!(alerts(&db, "subscriber").is_empty());
+    }
+
+    #[test]
+    fn unpopular_packages_are_not_targets() {
+        let (_dir, db) = open_db();
+        seed(
+            &db,
+            vec![collected("colorama", "Pypi", Some(MIN_TARGET_POPULARITY - 1), &[])],
+        );
+        subscribe(&db, "subscriber", "colorama");
+
+        store_package(
+            &db,
+            &TimelineBroadcaster::new(),
+            &LookalikeTargets::new(),
+            collected("colourama", "Pypi", Some(0), &[]),
+        )
+        .unwrap();
+
+        assert!(alerts(&db, "subscriber").is_empty());
+    }
+
+    /// crates.io reports no dependents count, so popularity comes from the
+    /// stored dependency lists instead.
+    #[test]
+    fn popularity_falls_back_to_stored_dependents() {
+        let (_dir, db) = open_db();
+        let mut seeded = vec![collected("serde_json", "crates.io", None, &[])];
+        for i in 0..MIN_TARGET_POPULARITY {
+            seeded.push(collected(&format!("user{i}"), "crates.io", None, &["serde_json"]));
+        }
+        seed(&db, seeded);
+        subscribe(&db, "subscriber", "serde_json");
+
+        store_package(
+            &db,
+            &TimelineBroadcaster::new(),
+            &LookalikeTargets::new(),
+            collected("serde-json", "crates.io", None, &[]),
+        )
+        .unwrap();
+
+        let events = alerts(&db, "subscriber");
+        assert_eq!(events.len(), 1);
+        assert!(events[0].message.contains("(separator or case swap)"), "{}", events[0].message);
     }
 
     #[test]

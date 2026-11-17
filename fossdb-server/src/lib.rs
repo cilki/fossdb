@@ -30,6 +30,8 @@ pub mod feed;
 #[cfg(feature = "api-server")]
 pub mod key_activity;
 #[cfg(feature = "api-server")]
+pub mod lookalike;
+#[cfg(feature = "api-server")]
 pub mod handlers;
 #[cfg(feature = "api-server")]
 pub mod middleware;
@@ -56,6 +58,9 @@ pub struct AppState {
     /// Claims expire, so a worker that dies mid-task does not block its version
     /// forever. See [`claims::ClaimSet`].
     pub claimed_versions: std::sync::Arc<std::sync::Mutex<claims::ClaimSet>>,
+    /// The popular package names each new package is checked against for
+    /// typosquatting. See [`lookalike::LookalikeTargets`].
+    pub lookalikes: std::sync::Arc<lookalike::LookalikeTargets>,
     /// Absolute origin this server is reachable at, used to build the
     /// self-referential links that feed readers require.
     pub public_base_url: String,

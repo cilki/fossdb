@@ -204,6 +204,59 @@ pub fn emit_security_alerts(
     }
 }
 
+/// Alert the subscribers of `lookalike.target` that `package`, which has just
+/// arrived, imitates its name.
+///
+/// The event is filed under the imitated package, not the new one: its
+/// subscribers depend on it, so they are the ones who might mistype it in a
+/// manifest, and nobody is subscribed to a package that did not exist a
+/// moment ago.
+pub fn emit_lookalike_alert(
+    db: &Database,
+    broadcaster: &TimelineBroadcaster,
+    package: &fossdb::Package,
+    lookalike: &crate::lookalike::Lookalike,
+) {
+    let target = &lookalike.target;
+    tracing::info!(
+        "New package {} resembles {} ({:?})",
+        package.name,
+        target.name,
+        lookalike.reason
+    );
+    let ecosystem = package
+        .platform
+        .as_deref()
+        .map(|p| format!("{p} "))
+        .unwrap_or_default();
+    let metadata = serde_json::json!({
+        "lookalike_package_id": package.id,
+        "lookalike_name": package.name,
+        "reason": lookalike.reason,
+        "severity": lookalike.reason.severity(),
+    });
+    notify_subscribers(
+        db,
+        broadcaster,
+        fossdb::TimelineEvent {
+            id: 0,
+            package_id: target.id,
+            user_id: None,
+            event_type: EventType::SecurityAlert,
+            package_name: target.name.clone(),
+            version: None,
+            message: format!(
+                "New {ecosystem}package {} closely resembles {} ({}). Check your manifests.",
+                package.name,
+                target.name,
+                lookalike.reason.describe()
+            ),
+            metadata: Some(metadata.to_string()),
+            created_at: Utc::now(),
+        },
+    );
+}
+
 /// E.g. `RUSTSEC-2016-0001 (High): SSL/TLS MitM vulnerability. Affects
 /// 0.8.3, 0.9.0. Fixed in 0.9.0.`
 fn security_alert_message(vulnerability: &fossdb::Vulnerability, versions: &[String]) -> String {

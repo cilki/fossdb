@@ -109,6 +109,7 @@ async fn start_server(config: Config) -> Result<()> {
         claimed_versions: std::sync::Arc::new(std::sync::Mutex::new(
             fossdb_server::claims::ClaimSet::new(),
         )),
+        lookalikes: std::sync::Arc::new(fossdb_server::lookalike::LookalikeTargets::new()),
         public_base_url: config.public_base_url.clone(),
         started_at: chrono::Utc::now(),
     };
