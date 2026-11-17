@@ -321,6 +321,18 @@ async fn subscribe(args: &Args, package: &str) -> Result<()> {
 
 async fn unsubscribe(args: &Args, package: &str) -> Result<()> {
     let (client, _) = authed_client(args)?;
+
+    // The server answers DELETE for a package the account does not follow
+    // with success and an unchanged list, so a mistyped name would otherwise
+    // be reported as "Unsubscribed" while the real subscription stays put.
+    let current = client.subscriptions().await?;
+    if !current.iter().any(|s| s.package_name == package) {
+        bail!(
+            "unsubscribing from {package} failed - {}",
+            client::not_subscribed(package)
+        );
+    }
+
     let subscriptions = client.unsubscribe(package).await?;
 
     if !args.json {
