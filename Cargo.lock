@@ -1628,11 +1628,13 @@ dependencies = [
  "fossdb",
  "futures",
  "reqwest 0.13.5",
+ "semver",
  "serde",
  "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zip",
 ]
 
 [[package]]

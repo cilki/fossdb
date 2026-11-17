@@ -95,6 +95,22 @@ impl CollectorClient {
         Ok(package)
     }
 
+    #[cfg(feature = "collector-osv")]
+    pub async fn submit_advisory(
+        &self,
+        advisory: &fossdb::CollectedAdvisory,
+    ) -> Result<fossdb::AdvisoryIngestResult> {
+        let resp = self
+            .client
+            .post(format!("{}/advisories", self.base_url))
+            .header("Authorization", self.auth_header())
+            .json(advisory)
+            .send()
+            .await?;
+
+        Ok(resp.error_for_status()?.json().await?)
+    }
+
     pub async fn update_package_timestamp(
         &self,
         name: &str,

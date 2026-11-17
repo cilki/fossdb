@@ -8,10 +8,12 @@ repository = "https://github.com/fossable/fossdb/"
 license = "Unlicense"
 
 [features]
-default = ["collector-rust", "collector-nixpkgs"]
+default = ["collector-rust", "collector-nixpkgs", "collector-osv"]
 collector-rust = ["dep:crates_io_api"]
 collector-nixpkgs = []
 collector-libraries-io = []
+# Security advisories from osv.dev (crates.io only, for now).
+collector-osv = ["dep:zip", "dep:semver"]
 
 [dependencies]
 # Workspace dependencies
@@ -33,3 +35,7 @@ dotenvy = "0.15"
 
 # Rust collector
 crates_io_api = { version = "0.12", default-features = false, features = ["rustls"], optional = true }
+
+# OSV collector
+semver = { version = "1.0", optional = true }
+zip = { version = "9", default-features = false, features = ["deflate-flate2-zlib-rs"], optional = true }

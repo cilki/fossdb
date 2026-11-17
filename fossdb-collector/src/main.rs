@@ -57,6 +57,17 @@ async fn main() -> Result<()> {
     #[cfg(feature = "collector-nixpkgs")]
     collector_list.push(Arc::new(collectors::nixpkgs::NixpkgsCollector {}));
 
+    #[cfg(feature = "collector-osv")]
+    {
+        // The export is a few MB; allow more than the 30 s used for API calls.
+        let http = reqwest::Client::builder()
+            .user_agent("fossdb-collector")
+            .timeout(std::time::Duration::from_secs(300))
+            .connect_timeout(std::time::Duration::from_secs(15))
+            .build()?;
+        collector_list.push(Arc::new(collectors::osv::OsvCollector::new(http)));
+    }
+
     #[cfg(feature = "collector-libraries-io")]
     if let Some(api_key) = config.libraries_io_api_key {
         let http = reqwest::Client::builder()

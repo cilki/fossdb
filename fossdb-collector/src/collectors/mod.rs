@@ -6,6 +6,8 @@ pub mod crates_io;
 pub mod libraries_io;
 #[cfg(feature = "collector-nixpkgs")]
 pub mod nixpkgs;
+#[cfg(feature = "collector-osv")]
+pub mod osv;
 
 #[async_trait::async_trait]
 pub trait Collector: Send + Sync {
