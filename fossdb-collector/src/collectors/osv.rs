@@ -1,15 +1,28 @@
 //! Security advisories from OSV (<https://osv.dev>).
 //!
-//! Each run downloads the ecosystem's bulk export (`all.zip`, one OSV JSON
-//! document per advisory) and submits every advisory that names a package
-//! FossDB stores to `POST /advisories`. The server upserts by advisory id, so
-//! resubmitting an unchanged advisory is a no-op and a revised one replaces
-//! the stored copy.
+//! Each run downloads the bulk export (`all.zip`, one OSV JSON document per
+//! advisory) of every configured ecosystem and submits every advisory that
+//! names a package FossDB stores to `POST /advisories`. The server upserts by
+//! advisory id, so resubmitting an unchanged advisory is a no-op and a revised
+//! one replaces the stored copy.
 //!
-//! Only crates.io is collected for now. OSV's crates.io entries mostly give
-//! affected versions as SEMVER ranges rather than enumerating them, so the
-//! ranges are evaluated here against the versions the server already stores;
-//! the server then links exactly those versions.
+//! The ecosystems come from `OSV_ECOSYSTEMS` (comma-separated OSV ecosystem
+//! names, default `crates.io`). Their names double as the `platform` the
+//! server matches packages against, case-insensitively, so `npm` advisories
+//! link to the `NPM` packages libraries.io stores.
+//!
+//! An advisory can span ecosystems (a GHSA record for both an npm package and
+//! a gem, say) and then appears in each of their exports. Because the server
+//! replaces the stored copy on every submission, the exports are merged first
+//! and such an advisory is submitted once, with its entries for all
+//! configured ecosystems; submitting it once per ecosystem would unlink
+//! whatever the previous submission linked.
+//!
+//! Affected versions are those OSV lists in `versions[]`, plus those inside
+//! a range. Ranges are only evaluated where the ordering is semver: SEMVER
+//! ranges, and ECOSYSTEM ranges of the ecosystems in [`SEMVER_ECOSYSTEMS`].
+//! Other ecosystems (PyPI's PEP 440, Maven, RubyGems, ...) have orderings of
+//! their own and rely on `versions[]`, which OSV enumerates for them.
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -26,17 +39,74 @@ use crate::collectors::Collector;
 
 const OSV_BUCKET: &str = "https://osv-vulnerabilities.storage.googleapis.com";
 
-/// OSV's name for the ecosystem, which is also the `platform` the crates.io
-/// collector stores packages under.
-const ECOSYSTEM: &str = "crates.io";
+/// Collected when `OSV_ECOSYSTEMS` is unset: the platform of the default
+/// `collector-rust` feature.
+const DEFAULT_ECOSYSTEM: &str = "crates.io";
+
+/// OSV's spelling of the ecosystems FossDB's collectors store packages for.
+/// `OSV_ECOSYSTEMS` is matched against these case-insensitively, since the
+/// bucket paths are case-sensitive.
+const KNOWN_ECOSYSTEMS: &[&str] = &[
+    "crates.io",
+    "npm",
+    "PyPI",
+    "Go",
+    "Maven",
+    "Packagist",
+    "NuGet",
+    "RubyGems",
+];
+
+/// Ecosystems whose versions are ordered as semver, so that their ECOSYSTEM
+/// ranges can be evaluated with the `semver` crate.
+const SEMVER_ECOSYSTEMS: &[&str] = &["crates.io", "npm", "Go"];
+
+/// The ecosystems named by `OSV_ECOSYSTEMS`, or [`DEFAULT_ECOSYSTEM`].
+pub fn ecosystems_from_env() -> Vec<String> {
+    parse_ecosystems(std::env::var("OSV_ECOSYSTEMS").ok().as_deref())
+}
+
+fn parse_ecosystems(raw: Option<&str>) -> Vec<String> {
+    let mut ecosystems: Vec<String> = Vec::new();
+    for name in raw.unwrap_or(DEFAULT_ECOSYSTEM).split(',').map(str::trim) {
+        if name.is_empty() {
+            continue;
+        }
+        let name = KNOWN_ECOSYSTEMS
+            .iter()
+            .find(|known| known.eq_ignore_ascii_case(name))
+            .map_or_else(|| name.to_string(), |known| known.to_string());
+        if !ecosystems.contains(&name) {
+            ecosystems.push(name);
+        }
+    }
+    if ecosystems.is_empty() {
+        ecosystems.push(DEFAULT_ECOSYSTEM.to_string());
+    }
+    ecosystems
+}
 
 pub struct OsvCollector {
     http: reqwest::Client,
+    ecosystems: Vec<String>,
 }
 
 impl OsvCollector {
-    pub fn new(http: reqwest::Client) -> Self {
-        Self { http }
+    pub fn new(http: reqwest::Client, ecosystems: Vec<String>) -> Self {
+        Self { http, ecosystems }
+    }
+
+    async fn download(&self, ecosystem: &str) -> Result<Vec<OsvRecord>> {
+        let url = format!("{OSV_BUCKET}/{ecosystem}/all.zip");
+        let bytes = self
+            .http
+            .get(&url)
+            .send()
+            .await?
+            .error_for_status()?
+            .bytes()
+            .await?;
+        tokio::task::spawn_blocking(move || read_dump(&bytes)).await?
     }
 }
 
@@ -47,18 +117,19 @@ impl Collector for OsvCollector {
     }
 
     async fn collect(&self, client: Arc<CollectorClient>) -> Result<()> {
-        let url = format!("{OSV_BUCKET}/{ECOSYSTEM}/all.zip");
-        let bytes = self
-            .http
-            .get(&url)
-            .send()
-            .await?
-            .error_for_status()?
-            .bytes()
-            .await?;
-        let records = tokio::task::spawn_blocking(move || read_dump(&bytes)).await??;
-        let advisories = prepare(records);
-        tracing::info!("OSV {}: {} advisories in export", ECOSYSTEM, advisories.len());
+        let mut exports = Vec::with_capacity(self.ecosystems.len());
+        for ecosystem in &self.ecosystems {
+            // Going on without one export would submit the advisories it
+            // shares with the others without its entries, and the server
+            // would unlink those.
+            let records = self
+                .download(ecosystem)
+                .await
+                .with_context(|| format!("OSV {ecosystem} export"))?;
+            tracing::info!("OSV {}: {} advisories in export", ecosystem, records.len());
+            exports.push(records);
+        }
+        let advisories = prepare(merge_exports(exports, &self.ecosystems));
 
         let mut lookups: HashMap<String, Option<PackageLookup>> = HashMap::new();
         let (mut submitted, mut created, mut failed) = (0usize, 0usize, 0usize);
@@ -115,7 +186,7 @@ impl Collector for OsvCollector {
 
         tracing::info!(
             "OSV {}: submitted {} advisories ({} new), {} failed",
-            ECOSYSTEM,
+            self.ecosystems.join(", "),
             submitted,
             created,
             failed
@@ -146,6 +217,26 @@ fn read_dump(bytes: &[u8]) -> Result<Vec<OsvRecord>> {
         }
     }
     Ok(records)
+}
+
+/// Combine the exports of the configured ecosystems into one record per
+/// advisory, keeping only the `affected` entries for those ecosystems.
+///
+/// A record spanning several ecosystems is the same document in each export,
+/// so the first copy is kept.
+fn merge_exports(exports: Vec<Vec<OsvRecord>>, ecosystems: &[String]) -> Vec<OsvRecord> {
+    let mut seen = HashSet::new();
+    exports
+        .into_iter()
+        .flatten()
+        .filter(|record| seen.insert(record.id.clone()))
+        .map(|mut record| {
+            if let Some(affected) = record.affected.as_mut() {
+                affected.retain(|a| ecosystems.contains(&a.package.ecosystem));
+            }
+            record
+        })
+        .collect()
 }
 
 // --- OSV schema (the subset used here) --------------------------------------
@@ -219,13 +310,10 @@ impl OsvRecord {
         self.aliases.as_deref().unwrap_or_default()
     }
 
-    /// The `affected` entries for [`ECOSYSTEM`]. A GHSA advisory can span
-    /// several ecosystems; the others are not ours to match.
+    /// The `affected` entries, which [`merge_exports`] has narrowed to the
+    /// configured ecosystems.
     fn affected(&self) -> impl Iterator<Item = &OsvAffected> {
-        self.affected
-            .iter()
-            .flatten()
-            .filter(|a| a.package.ecosystem == ECOSYSTEM)
+        self.affected.iter().flatten()
     }
 
     fn package_names(&self) -> impl Iterator<Item = &str> {
@@ -389,27 +477,37 @@ impl Prepared {
 
 /// Map one `affected` entry to the wire type, keeping only the stored
 /// versions it covers: those listed in `versions`, or inside one of its
-/// SEMVER/ECOSYSTEM ranges (crates.io versions are semver either way).
+/// ranges that can be evaluated as semver (see the module docs).
 fn collect_affected(affected: &OsvAffected, stored_versions: &[String]) -> CollectedAffected {
+    let ecosystem = affected.package.ecosystem.as_str();
+    let semver_ordered = SEMVER_ECOSYSTEMS.contains(&ecosystem);
     let listed: HashSet<&str> = affected
         .versions
         .iter()
         .flatten()
-        .map(String::as_str)
+        .map(|v| strip_go_prefix(ecosystem, v))
         .collect();
+    // Shown to users whatever the ecosystem.
     let ranges: Vec<&OsvRange> = affected
         .ranges
         .iter()
         .flatten()
         .filter(|r| r.kind == "SEMVER" || r.kind == "ECOSYSTEM")
         .collect();
+    let evaluated: Vec<&OsvRange> = ranges
+        .iter()
+        .copied()
+        .filter(|r| r.kind == "SEMVER" || semver_ordered)
+        .collect();
 
     let affected_versions = stored_versions
         .iter()
         .filter(|v| {
-            listed.contains(v.as_str())
-                || Version::parse(v)
-                    .is_ok_and(|parsed| ranges.iter().any(|r| range_contains(&r.events, &parsed)))
+            let v = strip_go_prefix(ecosystem, v);
+            listed.contains(v)
+                || Version::parse(v).is_ok_and(|parsed| {
+                    evaluated.iter().any(|r| range_contains(&r.events, &parsed))
+                })
         })
         .cloned()
         .collect();
@@ -425,10 +523,20 @@ fn collect_affected(affected: &OsvAffected, stored_versions: &[String]) -> Colle
 
     CollectedAffected {
         package_name: affected.package.name.clone(),
-        platform: ECOSYSTEM.to_string(),
+        platform: ecosystem.to_string(),
         affected_versions,
         ranges: ranges.iter().flat_map(|r| describe_range(&r.events)).collect(),
         fixed_in,
+    }
+}
+
+/// Go module versions carry a `v` (`v1.2.3`) that OSV leaves out of its
+/// ranges and version lists.
+fn strip_go_prefix<'a>(ecosystem: &str, version: &'a str) -> &'a str {
+    if ecosystem == "Go" {
+        version.strip_prefix('v').unwrap_or(version)
+    } else {
+        version
     }
 }
 
@@ -662,9 +770,48 @@ mod tests {
     fn prepared() -> HashMap<String, Prepared> {
         let records = read_dump(&fixture_zip()).unwrap();
         assert_eq!(records.len(), FIXTURES.len());
-        prepare(records)
+        by_id(prepare(merge_exports(vec![records], &ecosystems(&["crates.io"]))))
+    }
+
+    fn by_id(prepared: Vec<Prepared>) -> HashMap<String, Prepared> {
+        prepared
             .into_iter()
             .map(|p| (p.record.id.clone(), p))
+            .collect()
+    }
+
+    fn ecosystems(names: &[&str]) -> Vec<String> {
+        names.iter().map(|n| n.to_string()).collect()
+    }
+
+    fn record(json: &str) -> OsvRecord {
+        serde_json::from_str(json).unwrap()
+    }
+
+    /// lodash's GHSA record, which covers npm packages and a gem.
+    fn lodash() -> OsvRecord {
+        record(include_str!("../../testdata/osv/GHSA-35jh-r3h4-6jhm.json"))
+    }
+
+    /// The exports of npm, PyPI, Go and RubyGems, each holding the fixtures
+    /// that have entries for it.
+    fn other_exports() -> Vec<Vec<OsvRecord>> {
+        let pysec = || record(include_str!("../../testdata/osv/PYSEC-2023-74.json"));
+        let ghsa = || record(include_str!("../../testdata/osv/GHSA-j8r2-6x86-q33q.json"));
+        let go = || record(include_str!("../../testdata/osv/GO-2022-0969.json"));
+        vec![
+            vec![lodash()],
+            vec![pysec(), ghsa()],
+            vec![go()],
+            vec![lodash()],
+        ]
+    }
+
+    fn platforms(advisory: &CollectedAdvisory) -> Vec<(&str, &str)> {
+        advisory
+            .affected
+            .iter()
+            .map(|a| (a.platform.as_str(), a.package_name.as_str()))
             .collect()
     }
 
@@ -680,7 +827,7 @@ mod tests {
                 tags: Vec::new(),
                 created_at: Utc::now(),
                 updated_at: Utc::now(),
-                platform: Some(ECOSYSTEM.to_string()),
+                platform: Some(DEFAULT_ECOSYSTEM.to_string()),
                 language: None,
                 status: None,
                 dependents_count: None,
@@ -765,17 +912,96 @@ mod tests {
 
     #[test]
     fn other_ecosystems_are_ignored() {
-        let mut record: OsvRecord =
-            serde_json::from_str(include_str!("../../testdata/osv/RUSTSEC-2016-0001.json")).unwrap();
-        for a in record.affected.iter_mut().flatten() {
-            a.package.ecosystem = "npm".to_string();
-        }
-        let p = Prepared {
-            record,
-            severity: VulnerabilitySeverity::High,
-        };
-        let openssl = lookup("openssl", &["0.8.3"]);
-        assert!(collect(&p, &openssl).is_none());
+        let merged = merge_exports(vec![vec![lodash()]], &ecosystems(&["npm"]));
+        let prepared = by_id(prepare(merged));
+        let rails = lookup("lodash-rails", &["4.17.4"]);
+        assert!(collect(&prepared["GHSA-35jh-r3h4-6jhm"], &rails).is_none());
+
+        let merged = merge_exports(vec![vec![lodash()]], &ecosystems(&["crates.io"]));
+        let prepared = by_id(prepare(merged));
+        let lodash = lookup("lodash", &["4.17.20"]);
+        assert!(collect(&prepared["GHSA-35jh-r3h4-6jhm"], &lodash).is_none());
+    }
+
+    #[test]
+    fn advisory_in_several_exports_is_submitted_once_with_every_ecosystem() {
+        let merged = merge_exports(other_exports(), &ecosystems(&["npm", "RubyGems"]));
+        assert_eq!(merged.iter().filter(|r| r.id == "GHSA-35jh-r3h4-6jhm").count(), 1);
+        let prepared = by_id(prepare(merged));
+
+        let lodash = lookup("lodash", &["4.17.20", "4.17.21"]);
+        let rails = lookup("lodash-rails", &["4.17.4"]);
+        let packages = HashMap::from([("lodash", &lodash), ("lodash-rails", &rails)]);
+        let advisory = prepared["GHSA-35jh-r3h4-6jhm"].to_collected(&packages).unwrap();
+        assert_eq!(
+            platforms(&advisory),
+            vec![("npm", "lodash"), ("RubyGems", "lodash-rails")]
+        );
+        assert_eq!(advisory.affected[0].affected_versions, vec!["4.17.20"]);
+        assert_eq!(advisory.affected[1].affected_versions, vec!["4.17.4"]);
+        assert_eq!(advisory.severity, VulnerabilitySeverity::High);
+    }
+
+    #[test]
+    fn non_semver_ecosystems_link_only_listed_versions() {
+        let merged = merge_exports(other_exports(), &ecosystems(&["RubyGems"]));
+        let prepared = by_id(prepare(merged));
+        // 4.17.20 is inside `>=0, <4.17.21` but not in OSV's list for the
+        // gem, and RubyGems ordering is not semver, so it is not linked.
+        let rails = lookup("lodash-rails", &["4.17.4", "4.17.20"]);
+        let advisory = collect(&prepared["GHSA-35jh-r3h4-6jhm"], &rails).unwrap();
+        let affected = &advisory.affected[0];
+        assert_eq!(affected.affected_versions, vec!["4.17.4"]);
+        // The range is still shown.
+        assert_eq!(affected.ranges, vec!["<4.17.21"]);
+        assert_eq!(affected.fixed_in.as_deref(), Some("4.17.21"));
+    }
+
+    #[test]
+    fn pypi_advisory_drops_its_ghsa_copy_and_keeps_its_rating() {
+        let merged = merge_exports(other_exports(), &ecosystems(&["PyPI"]));
+        let prepared = by_id(prepare(merged));
+        assert!(!prepared.contains_key("GHSA-j8r2-6x86-q33q"));
+
+        let requests = lookup("requests", &["2.2.1", "2.3.0", "2.30.0", "2.31.0"]);
+        let advisory = collect(&prepared["PYSEC-2023-74"], &requests).unwrap();
+        // GitHub rates it MODERATE; the PYSEC record has no rating.
+        assert_eq!(advisory.severity, VulnerabilitySeverity::Medium);
+        let affected = &advisory.affected[0];
+        assert_eq!(affected.platform, "PyPI");
+        assert_eq!(affected.affected_versions, vec!["2.3.0", "2.30.0"]);
+        // The GIT range (commit hashes) is neither shown nor evaluated.
+        assert_eq!(affected.ranges, vec![">=2.3.0, <2.31.0"]);
+        assert_eq!(affected.fixed_in.as_deref(), Some("2.31.0"));
+    }
+
+    #[test]
+    fn go_versions_match_without_their_v_prefix() {
+        let merged = merge_exports(other_exports(), &ecosystems(&["Go"]));
+        let prepared = by_id(prepare(merged));
+        let net = lookup(
+            "golang.org/x/net",
+            &[
+                "v0.0.0-20220722155237-a158d28d115b",
+                "v0.0.0-20220906165146-f3363e06e74c",
+                "v0.1.0",
+            ],
+        );
+        let advisory = collect(&prepared["GO-2022-0969"], &net).unwrap();
+        assert_eq!(
+            advisory.affected[0].affected_versions,
+            vec!["v0.0.0-20220722155237-a158d28d115b"]
+        );
+    }
+
+    #[test]
+    fn ecosystems_are_read_case_insensitively() {
+        assert_eq!(parse_ecosystems(None), vec!["crates.io"]);
+        assert_eq!(parse_ecosystems(Some(" ,")), vec!["crates.io"]);
+        assert_eq!(
+            parse_ecosystems(Some("crates.io, NPM,pypi,npm,Hex")),
+            vec!["crates.io", "npm", "PyPI", "Hex"]
+        );
     }
 
     #[test]

@@ -12,7 +12,8 @@ default = ["collector-rust", "collector-nixpkgs", "collector-osv"]
 collector-rust = ["dep:crates_io_api"]
 collector-nixpkgs = []
 collector-libraries-io = []
-# Security advisories from osv.dev (crates.io only, for now).
+# Security advisories from osv.dev for the ecosystems in OSV_ECOSYSTEMS
+# (default crates.io).
 collector-osv = ["dep:zip", "dep:semver"]
 
 [dependencies]

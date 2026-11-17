@@ -59,13 +59,16 @@ async fn main() -> Result<()> {
 
     #[cfg(feature = "collector-osv")]
     {
-        // The export is a few MB; allow more than the 30 s used for API calls.
+        // Exports run from a few MB (crates.io) to tens of MB (npm); allow
+        // more than the 30 s used for API calls.
         let http = reqwest::Client::builder()
             .user_agent("fossdb-collector")
             .timeout(std::time::Duration::from_secs(300))
             .connect_timeout(std::time::Duration::from_secs(15))
             .build()?;
-        collector_list.push(Arc::new(collectors::osv::OsvCollector::new(http)));
+        let ecosystems = collectors::osv::ecosystems_from_env();
+        tracing::info!("OSV ecosystems: {}", ecosystems.join(", "));
+        collector_list.push(Arc::new(collectors::osv::OsvCollector::new(http, ecosystems)));
     }
 
     #[cfg(feature = "collector-libraries-io")]
