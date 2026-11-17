@@ -1,4 +1,5 @@
 pub mod binary;
+mod hooks;
 pub mod source;
 #[cfg(feature = "analysis-symbolic")]
 pub mod symbolic;

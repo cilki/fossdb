@@ -462,6 +462,14 @@ pub enum FindingKind {
     BinaryMetadata,
     MaliciousPattern,
     SyscallReachable,
+    /// Code the package runs when it is installed or built: npm lifecycle
+    /// scripts, Cargo build scripts and proc-macros, Python `setup.py` and
+    /// executable `.pth` files.
+    ///
+    /// `location` identifies the hook relative to the package root (without
+    /// the versioned top-level directory that tarballs carry), so the same hook
+    /// has the same location in every version of the package.
+    InstallHook,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

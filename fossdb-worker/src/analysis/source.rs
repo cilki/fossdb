@@ -254,6 +254,8 @@ fn analyze_directory(dir: &Path) -> Result<SourceAnalysis> {
         }
     }
 
+    findings.extend(super::hooks::detect_install_hooks(&super::hooks::package_root(dir)));
+
     // Distinguish "no license file at all" from "license file present but its
     // text is not one we recognize" - the previous code reported both as
     // "No license file found", which was simply untrue for the second case.
@@ -583,6 +585,32 @@ mod tests {
             "got {:?}",
             analysis.findings
         );
+    }
+
+    /// Install hooks are keyed relative to the package root, so the same hook
+    /// in two releases has the same location even though each tarball wraps
+    /// its files in a differently named versioned directory.
+    #[cfg(feature = "analysis-source")]
+    #[test]
+    fn install_hook_locations_are_stable_across_versions() {
+        let hooks_of = |top: &str| {
+            let package_json = br#"{"scripts":{"postinstall":"node install.js"}}"#;
+            let bytes = targz_of(&[
+                (&format!("{}/package.json", top), package_json.as_slice()),
+                (&format!("{}/test/fixture/package.json", top), package_json.as_slice()),
+            ]);
+            let tmp = write_temp(&bytes);
+            let analysis = analyze_archive(tmp.path(), ArchiveFormat::TarGz).unwrap();
+            analysis
+                .findings
+                .into_iter()
+                .filter(|f| f.kind == FindingKind::InstallHook)
+                .map(|f| f.location.unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(hooks_of("left-pad-1.3.0"), vec!["package.json:scripts.postinstall"]);
+        assert_eq!(hooks_of("left-pad-1.3.1"), hooks_of("left-pad-1.3.0"));
     }
 
     /// A decompression bomb must be rejected rather than filling the disk. A
