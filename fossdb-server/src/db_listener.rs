@@ -23,9 +23,7 @@ pub fn spawn_package_version_listener(
         loop {
             match recv.recv() {
                 Ok(event) => {
-                    if let Err(e) =
-                        handle_package_version_event(event, db.clone(), broadcaster.clone()).await
-                    {
+                    if let Err(e) = handle_package_version_event(event, &db, &broadcaster) {
                         tracing::error!("Error handling package version event: {}", e);
                     }
                 }
@@ -42,10 +40,10 @@ pub fn spawn_package_version_listener(
     Ok(())
 }
 
-async fn handle_package_version_event(
+fn handle_package_version_event(
     event: Event,
-    db: Arc<Database>,
-    broadcaster: Arc<TimelineBroadcaster>,
+    db: &Database,
+    broadcaster: &TimelineBroadcaster,
 ) -> Result<()> {
     // Only handle Insert events (new versions)
     let version: PackageVersion = match event {
@@ -75,80 +73,61 @@ async fn handle_package_version_event(
         }
     };
 
-    let now = Utc::now();
-
-    // Create timeline events for subscribed users
-    match db.get_users_subscribed_to(&package.name) {
-        Ok(subscribed_users) => {
-            for user_id in subscribed_users {
-                let event = TimelineEvent {
-                    inner: fossdb::TimelineEvent {
-                        id: 0,
-                        package_id: package.id,
-                        user_id: Some(user_id.clone()),
-                        event_type: EventType::NewRelease,
-                        package_name: package.name.clone(),
-                        version: Some(version.version.clone()),
-                        message: format!("New version {} released", version.version),
-                        metadata: None,
-                        created_at: now,
-                    },
-                };
-
-                match db.insert_timeline_event(event) {
-                    Ok(saved_event) => {
-                        // Broadcast the event to connected WebSocket clients
-                        broadcaster.broadcast(saved_event);
-                        tracing::debug!(
-                            "Created timeline event for user {} for {} {}",
-                            user_id,
-                            package.name,
-                            version.version
-                        );
-                    }
-                    Err(e) => {
-                        tracing::error!(
-                            "Failed to create timeline event for user {}: {}",
-                            user_id,
-                            e
-                        );
-                    }
-                }
-            }
-        }
-        Err(e) => {
-            tracing::error!(
-                "Failed to get subscribed users for {}: {}",
-                package.name,
-                e
-            );
-        }
-    }
-
-    // Broadcast a global event to WebSocket clients (not stored in database)
-    let global_event = TimelineEvent {
-        inner: fossdb::TimelineEvent {
+    tracing::info!("New release: {} {}", package.name, version.version);
+    notify_subscribers(
+        db,
+        broadcaster,
+        fossdb::TimelineEvent {
             id: 0,
             package_id: package.id,
             user_id: None,
             event_type: EventType::NewRelease,
-            package_name: package.name.clone(),
-            version: Some(version.version.clone()),
+            package_name: package.inner.name,
             message: format!("New version {} released", version.version),
+            version: Some(version.inner.version),
             metadata: None,
-            created_at: now,
+            created_at: Utc::now(),
         },
-    };
-
-    // Broadcast the global event to connected WebSocket clients
-    broadcaster.broadcast(global_event);
-    tracing::info!(
-        "Broadcast global timeline event for {} {}",
-        package.name,
-        version.version
     );
 
     Ok(())
+}
+
+/// Store a copy of `event` for every account subscribed to its package and
+/// broadcast each copy, then broadcast `event` itself as the global,
+/// unstored event.
+fn notify_subscribers(
+    db: &Database,
+    broadcaster: &TimelineBroadcaster,
+    event: fossdb::TimelineEvent,
+) {
+    match db.get_users_subscribed_to(&event.package_name) {
+        Ok(users) => {
+            for user_id in users {
+                let personal = TimelineEvent {
+                    inner: fossdb::TimelineEvent {
+                        user_id: Some(user_id),
+                        ..event.clone()
+                    },
+                };
+                match db.insert_timeline_event(personal) {
+                    Ok(saved) => broadcaster.broadcast(saved),
+                    Err(e) => tracing::error!(
+                        "Failed to store timeline event for {}: {}",
+                        event.package_name,
+                        e
+                    ),
+                }
+            }
+        }
+        Err(e) => tracing::error!(
+            "Failed to get subscribed users for {}: {}",
+            event.package_name,
+            e
+        ),
+    }
+
+    broadcaster.broadcast(TimelineEvent { inner: event });
 }
 
 /// How many affected versions a `SecurityAlert` message names before it
@@ -194,55 +173,33 @@ pub fn emit_security_alerts(
             }
         };
 
-        let message = security_alert_message(vulnerability, versions);
+        tracing::info!(
+            "Security alert for {}: {} affects {} version(s)",
+            package.name,
+            vulnerability.source_id,
+            versions.len()
+        );
         let metadata = serde_json::json!({
             "vulnerability_id": vulnerability.id,
             "source_id": vulnerability.source_id,
             "cve_id": vulnerability.cve_id,
             "severity": vulnerability.severity,
             "versions": versions,
-        })
-        .to_string();
-        let event = |user_id: Option<String>| TimelineEvent {
-            inner: fossdb::TimelineEvent {
+        });
+        notify_subscribers(
+            db,
+            broadcaster,
+            fossdb::TimelineEvent {
                 id: 0,
                 package_id,
-                user_id,
+                user_id: None,
                 event_type: EventType::SecurityAlert,
-                package_name: package.name.clone(),
+                package_name: package.inner.name,
                 version: None,
-                message: message.clone(),
-                metadata: Some(metadata.clone()),
+                message: security_alert_message(vulnerability, versions),
+                metadata: Some(metadata.to_string()),
                 created_at: Utc::now(),
             },
-        };
-
-        match db.get_users_subscribed_to(&package.name) {
-            Ok(users) => {
-                for user_id in users {
-                    match db.insert_timeline_event(event(Some(user_id))) {
-                        Ok(saved) => broadcaster.broadcast(saved),
-                        Err(e) => tracing::error!(
-                            "Failed to store security alert for {}: {}",
-                            package.name,
-                            e
-                        ),
-                    }
-                }
-            }
-            Err(e) => tracing::error!(
-                "Failed to get subscribed users for {}: {}",
-                package.name,
-                e
-            ),
-        }
-
-        broadcaster.broadcast(event(None));
-        tracing::info!(
-            "Security alert for {}: {} affects {} version(s)",
-            package.name,
-            vulnerability.source_id,
-            versions.len()
         );
     }
 }

@@ -49,41 +49,23 @@ pub async fn upsert_package(
 ) -> Result<Json<fossdb::Package>, StatusCode> {
     let now = Utc::now();
 
-    match state.db.get_package_by_name(&collected.name) {
-        Ok(Some(existing)) => {
-            let existing_versions: HashSet<String> = state.db
+    let existing = state.db.get_package_by_name(&collected.name).map_err(|e| {
+        tracing::error!("DB error checking package: {}", e);
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
+
+    let (package, known_versions) = match existing {
+        Some(existing) => {
+            let known: HashSet<String> = state
+                .db
                 .get_versions_by_package(existing.id)
                 .unwrap_or_default()
                 .into_iter()
-                .map(|v| v.version.clone())
+                .map(|v| v.inner.version)
                 .collect();
-
-            for v in collected.versions {
-                if !existing_versions.contains(&v.version) {
-                    tracing::info!("New version detected: {} {}", existing.name, v.version);
-                    let version = PackageVersion {
-                        inner: fossdb::PackageVersion {
-                            id: 0,
-                            package_id: existing.id,
-                            version: v.version,
-                            release_date: v.release_date,
-                            download_url: v.download_url,
-                            checksum: v.checksum,
-                            dependencies: v.dependencies,
-                            vulnerabilities: Vec::new(),
-                            changelog: v.changelog,
-                            created_at: now,
-                        },
-                    };
-                    if let Err(e) = state.db.insert_version(version) {
-                        tracing::error!("Failed to insert version: {}", e);
-                    }
-                }
-            }
-
-            Ok(Json(existing.inner))
+            (existing, known)
         }
-        Ok(None) => {
+        None => {
             let package = Package {
                 inner: fossdb::Package {
                     id: 0,
@@ -102,42 +84,40 @@ pub async fn upsert_package(
                     rank: collected.rank,
                 },
             };
-
-            match state.db.insert_package(package) {
-                Ok(saved) => {
-                    tracing::info!("Saved new package: {}", saved.name);
-                    for v in collected.versions {
-                        let version = PackageVersion {
-                            inner: fossdb::PackageVersion {
-                                id: 0,
-                                package_id: saved.id,
-                                version: v.version,
-                                release_date: v.release_date,
-                                download_url: v.download_url,
-                                checksum: v.checksum,
-                                dependencies: v.dependencies,
-                                vulnerabilities: Vec::new(),
-                                changelog: v.changelog,
-                                created_at: now,
-                            },
-                        };
-                        if let Err(e) = state.db.insert_version(version) {
-                            tracing::error!("Failed to insert version: {}", e);
-                        }
-                    }
-                    Ok(Json(saved.inner))
-                }
-                Err(e) => {
-                    tracing::error!("Failed to insert package: {}", e);
-                    Err(StatusCode::INTERNAL_SERVER_ERROR)
-                }
-            }
+            let saved = state.db.insert_package(package).map_err(|e| {
+                tracing::error!("Failed to insert package: {}", e);
+                StatusCode::INTERNAL_SERVER_ERROR
+            })?;
+            tracing::info!("Saved new package: {}", saved.name);
+            (saved, HashSet::new())
         }
-        Err(e) => {
-            tracing::error!("DB error checking package: {}", e);
-            Err(StatusCode::INTERNAL_SERVER_ERROR)
+    };
+
+    // Each insert is announced by the PackageVersion watch in db_listener.
+    for v in collected.versions {
+        if known_versions.contains(&v.version) {
+            continue;
+        }
+        let version = PackageVersion {
+            inner: fossdb::PackageVersion {
+                id: 0,
+                package_id: package.id,
+                version: v.version,
+                release_date: v.release_date,
+                download_url: v.download_url,
+                checksum: v.checksum,
+                dependencies: v.dependencies,
+                vulnerabilities: Vec::new(),
+                changelog: v.changelog,
+                created_at: now,
+            },
+        };
+        if let Err(e) = state.db.insert_version(version) {
+            tracing::error!("Failed to insert version: {}", e);
         }
     }
+
+    Ok(Json(package.inner))
 }
 
 pub async fn upsert_advisory(
