@@ -825,6 +825,46 @@ mod tests {
     }
 
     #[test]
+    fn search_results_mark_only_their_lookalikes() {
+        use crate::handlers::packages::{package_lookalike, page_lookalikes};
+
+        let (_dir, db) = open_db();
+        seed(
+            &db,
+            vec![
+                collected("colorama", "Pypi", Some(5000), &[]),
+                collected("colourama", "Pypi", Some(0), &[]),
+                collected("colorama-js", "Pypi", Some(0), &[]),
+                collected("termcolor", "Pypi", Some(0), &[]),
+            ],
+        );
+        let package = |name: &str| db.get_package_by_name(name).unwrap().unwrap();
+        let lookalikes = LookalikeTargets::new();
+
+        let page: Vec<_> = ["colorama", "colourama", "colorama-js", "termcolor"]
+            .into_iter()
+            .map(package)
+            .collect();
+        let marked = page_lookalikes(&db, &lookalikes, &page);
+
+        let mut ids: Vec<u64> = marked.keys().copied().collect();
+        ids.sort();
+        let mut expected = vec![package("colourama").id, package("colorama-js").id];
+        expected.sort();
+        assert_eq!(ids, expected, "only the two imitations are marked");
+
+        // Each marker is exactly what the package page shows.
+        for (id, lookalike) in &marked {
+            let on_page = package_lookalike(&db, &lookalikes, *id).unwrap().unwrap();
+            assert_eq!(on_page.as_ref(), Some(lookalike));
+        }
+
+        // Packages outside the page are not checked or reported.
+        let only_target = page_lookalikes(&db, &lookalikes, &[package("colorama")]);
+        assert!(only_target.is_empty());
+    }
+
+    #[test]
     fn unknown_package_is_skipped_and_not_stored() {
         let (_dir, db) = open_db();
 

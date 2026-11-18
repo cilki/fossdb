@@ -3,6 +3,8 @@ use crate::api::ApiClient;
 use crate::components::PackageCard;
 use crate::hooks::{use_auth, LocalStorage, StorageKey};
 use dioxus::prelude::*;
+use fossdb::typosquat::PackageLookalike;
+use std::collections::HashMap;
 
 #[derive(Clone, PartialEq)]
 pub struct PackageFilters {
@@ -31,6 +33,8 @@ impl Default for PackageFilters {
 pub fn Packages() -> Element {
     let auth = use_auth();
     let mut packages = use_signal(|| Vec::<Package>::new());
+    // Package id -> the popular package its name imitates.
+    let mut lookalikes = use_signal(HashMap::<u64, PackageLookalike>::new);
     let mut filters = use_signal(PackageFilters::default);
     let mut loading = use_signal(|| true);
     let mut show_advanced = use_signal(|| false);
@@ -97,6 +101,7 @@ pub fn Packages() -> Element {
                 }
 
                 packages.set(pkg_list);
+                lookalikes.set(response.lookalikes);
                 total_packages.set(response.total);
                 total_pages.set(((response.total as f64) / (page_size as f64)).ceil() as u32);
             }
@@ -319,7 +324,11 @@ pub fn Packages() -> Element {
                             "space-y-4"
                         },
                         for package in packages().iter() {
-                            PackageCard { package: package.clone() }
+                            PackageCard {
+                                key: "{package.id}",
+                                package: package.clone(),
+                                lookalike: lookalikes().get(&package.id).cloned(),
+                            }
                         }
                     }
                 }

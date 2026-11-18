@@ -3,7 +3,8 @@ use crate::api::ApiClient;
 use crate::components::PackageCard;
 use crate::hooks::{use_auth, use_time_ago, use_websocket};
 use dioxus::prelude::*;
-use std::collections::HashSet;
+use fossdb::typosquat::PackageLookalike;
+use std::collections::{HashMap, HashSet};
 
 #[component]
 pub fn Home() -> Element {
@@ -11,6 +12,8 @@ pub fn Home() -> Element {
     let mut stats = use_signal(|| None::<DatabaseStats>);
     let mut timeline_events = use_signal(|| Vec::<TimelineEvent>::new());
     let mut latest_packages = use_signal(|| Vec::<Package>::new());
+    // Recently added is where a fresh typosquat shows up first.
+    let mut latest_lookalikes = use_signal(HashMap::<u64, PackageLookalike>::new);
     let mut loading = use_signal(|| true);
     let mut timeline_offset = use_signal(|| 0);
     let mut timeline_total = use_signal(|| 0);
@@ -59,6 +62,7 @@ pub fn Home() -> Element {
                     .await
                 {
                     latest_packages.set(response.packages);
+                    latest_lookalikes.set(response.lookalikes);
                 }
             }
 
@@ -234,7 +238,11 @@ pub fn Home() -> Element {
                                                 }
                                                 div { class: "grid grid-cols-1 md:grid-cols-2 gap-4",
                                                     for pkg in latest_packages().iter() {
-                                                        PackageCard { key: "{pkg.id}", package: pkg.clone() }
+                                                        PackageCard {
+                                                            key: "{pkg.id}",
+                                                            package: pkg.clone(),
+                                                            lookalike: latest_lookalikes().get(&pkg.id).cloned(),
+                                                        }
                                                     }
                                                 }
                                             }

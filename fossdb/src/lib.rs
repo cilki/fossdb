@@ -327,6 +327,11 @@ pub struct PackagesResponse {
     pub total: usize,
     pub page: u32,
     pub limit: u32,
+    /// For each package in `packages` whose name imitates a popular package,
+    /// keyed by package id: what it imitates. Judged by the same rules as the
+    /// package page's warning. Absent from servers that predate it.
+    #[serde(default)]
+    pub lookalikes: std::collections::HashMap<u64, typosquat::PackageLookalike>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -555,6 +560,24 @@ impl std::fmt::Debug for WebSocketMessage {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn packages_response_lookalikes_are_keyed_by_id_and_optional() {
+        // Servers that predate search-result markers send no `lookalikes`.
+        let response: PackagesResponse =
+            serde_json::from_str(r#"{"packages":[],"total":0,"page":1,"limit":30}"#).unwrap();
+        assert!(response.lookalikes.is_empty());
+
+        // JSON object keys are strings; the id still has to come back a u64.
+        let response: PackagesResponse = serde_json::from_str(
+            r#"{"packages":[],"total":0,"page":1,"limit":30,"lookalikes":{"12":
+                {"target_id":7,"target_name":"colorama","target_dependents":5000,
+                 "reason":"Edit1","severity":"Medium"}}}"#,
+        )
+        .unwrap();
+        assert_eq!(response.lookalikes[&12].target_name, "colorama");
+        assert_eq!(response.lookalikes[&12].reason, typosquat::SquatReason::Edit1);
+    }
 
     fn sample_user() -> User {
         User {

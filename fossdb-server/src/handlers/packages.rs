@@ -110,11 +110,14 @@ pub async fn list_packages(
             let paginated_packages: Vec<Package> =
                 packages.into_iter().skip(offset).take(limit).collect();
 
+            let lookalikes = page_lookalikes(&state.db, &state.lookalikes, &paginated_packages);
+
             Ok(Json(serde_json::json!({
                 "packages": paginated_packages,
                 "total": total,
                 "page": page,
-                "limit": limit
+                "limit": limit,
+                "lookalikes": lookalikes
             })))
         }
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
@@ -344,13 +347,43 @@ pub fn package_lookalike(
     let Some(package) = db.get_package(package_id)? else {
         return Ok(None);
     };
-    Ok(Some(lookalikes.check(db, &package)?.map(|l| PackageLookalike {
+    Ok(Some(lookalike_of_package(db, lookalikes, &package)?))
+}
+
+fn lookalike_of_package(
+    db: &Database,
+    lookalikes: &LookalikeTargets,
+    package: &Package,
+) -> anyhow::Result<Option<PackageLookalike>> {
+    Ok(lookalikes.check(db, package)?.map(|l| PackageLookalike {
         target_id: l.target.id,
         target_name: l.target.name,
         target_dependents: l.target.popularity,
         reason: l.reason,
         severity: l.reason.severity(),
-    })))
+    }))
+}
+
+/// The lookalikes among one page of `GET /api/packages` results, keyed by
+/// package id, so search results can mark them without a request per row.
+///
+/// A failed check leaves its package unmarked rather than failing the
+/// listing: the marker is advice, the listing is what was asked for.
+pub fn page_lookalikes(
+    db: &Database,
+    lookalikes: &LookalikeTargets,
+    packages: &[Package],
+) -> HashMap<u64, PackageLookalike> {
+    packages
+        .iter()
+        .filter_map(|package| match lookalike_of_package(db, lookalikes, package) {
+            Ok(found) => found.map(|l| (package.id, l)),
+            Err(e) => {
+                tracing::warn!("Lookalike check of package {} failed: {}", package.id, e);
+                None
+            }
+        })
+        .collect()
 }
 
 pub async fn get_package_subscriber_count(

@@ -2,9 +2,22 @@ use crate::api::types::Package;
 use crate::Route;
 use crate::components::use_comparison;
 use dioxus::prelude::*;
+use fossdb::typosquat::PackageLookalike;
 
+/// Tooltip of a card's lookalike marker, e.g. `Name resembles colorama (one
+/// character different). Check before installing.`
+fn lookalike_marker_title(lookalike: &PackageLookalike) -> String {
+    format!(
+        "Name resembles {} ({}). Check before installing.",
+        lookalike.target_name,
+        lookalike.reason.describe()
+    )
+}
+
+/// `lookalike` marks a package whose name imitates a popular one; the
+/// package page explains it in full.
 #[component]
-pub fn PackageCard(package: Package) -> Element {
+pub fn PackageCard(package: Package, #[props(default)] lookalike: Option<PackageLookalike>) -> Element {
     // `ComparisonContext::add` had no caller anywhere in the crate, so the
     // comparison state was always empty and `ComparisonBar` always
     // early-returned - the entire compare feature was unreachable UI.
@@ -24,6 +37,14 @@ pub fn PackageCard(package: Package) -> Element {
                     span { class: "px-3 py-1 bg-blue-900 text-blue-300 rounded-full text-xs font-medium",
                         "{license}"
                     }
+                }
+            }
+
+            if let Some(lookalike) = &lookalike {
+                div {
+                    class: "mb-3 inline-block px-2 py-1 bg-yellow-900 text-yellow-300 border border-yellow-700 rounded text-xs font-medium",
+                    title: "{lookalike_marker_title(lookalike)}",
+                    "Possible lookalike of {lookalike.target_name}"
                 }
             }
 
@@ -84,5 +105,27 @@ pub fn PackageCard(package: Package) -> Element {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fossdb::typosquat::SquatReason;
+    use fossdb::FindingSeverity;
+
+    #[test]
+    fn lookalike_marker_title_names_the_target_and_reason() {
+        let lookalike = PackageLookalike {
+            target_id: 7,
+            target_name: "colorama".into(),
+            target_dependents: 5000,
+            reason: SquatReason::Edit1,
+            severity: FindingSeverity::Medium,
+        };
+        assert_eq!(
+            lookalike_marker_title(&lookalike),
+            "Name resembles colorama (one character different). Check before installing."
+        );
     }
 }
