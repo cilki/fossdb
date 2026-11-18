@@ -347,21 +347,7 @@ pub fn package_lookalike(
     let Some(package) = db.get_package(package_id)? else {
         return Ok(None);
     };
-    Ok(Some(lookalike_of_package(db, lookalikes, &package)?))
-}
-
-fn lookalike_of_package(
-    db: &Database,
-    lookalikes: &LookalikeTargets,
-    package: &Package,
-) -> anyhow::Result<Option<PackageLookalike>> {
-    Ok(lookalikes.check(db, package)?.map(|l| PackageLookalike {
-        target_id: l.target.id,
-        target_name: l.target.name,
-        target_dependents: l.target.popularity,
-        reason: l.reason,
-        severity: l.reason.severity(),
-    }))
+    Ok(Some(lookalikes.check(db, &package)?))
 }
 
 /// The lookalikes among one page of `GET /api/packages` results, keyed by
@@ -376,7 +362,7 @@ pub fn page_lookalikes(
 ) -> HashMap<u64, PackageLookalike> {
     packages
         .iter()
-        .filter_map(|package| match lookalike_of_package(db, lookalikes, package) {
+        .filter_map(|package| match lookalikes.check(db, package) {
             Ok(found) => found.map(|l| (package.id, l)),
             Err(e) => {
                 tracing::warn!("Lookalike check of package {} failed: {}", package.id, e);

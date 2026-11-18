@@ -204,8 +204,8 @@ pub fn emit_security_alerts(
     }
 }
 
-/// Alert the subscribers of `lookalike.target` that `package`, which has just
-/// arrived, imitates its name.
+/// Alert the subscribers of the package `lookalike` targets that `package`,
+/// which has just arrived, imitates its name.
 ///
 /// The event is filed under the imitated package, not the new one: its
 /// subscribers depend on it, so they are the ones who might mistype it in a
@@ -215,13 +215,12 @@ pub fn emit_lookalike_alert(
     db: &Database,
     broadcaster: &TimelineBroadcaster,
     package: &fossdb::Package,
-    lookalike: &crate::lookalike::Lookalike,
+    lookalike: &fossdb::typosquat::PackageLookalike,
 ) {
-    let target = &lookalike.target;
     tracing::info!(
         "New package {} resembles {} ({:?})",
         package.name,
-        target.name,
+        lookalike.target_name,
         lookalike.reason
     );
     let ecosystem = package
@@ -233,22 +232,22 @@ pub fn emit_lookalike_alert(
         "lookalike_package_id": package.id,
         "lookalike_name": package.name,
         "reason": lookalike.reason,
-        "severity": lookalike.reason.severity(),
+        "severity": lookalike.severity,
     });
     notify_subscribers(
         db,
         broadcaster,
         fossdb::TimelineEvent {
             id: 0,
-            package_id: target.id,
+            package_id: lookalike.target_id,
             user_id: None,
             event_type: EventType::SecurityAlert,
-            package_name: target.name.clone(),
+            package_name: lookalike.target_name.clone(),
             version: None,
             message: format!(
                 "New {ecosystem}package {} closely resembles {} ({}). Check your manifests.",
                 package.name,
-                target.name,
+                lookalike.target_name,
                 lookalike.reason.describe()
             ),
             metadata: Some(metadata.to_string()),

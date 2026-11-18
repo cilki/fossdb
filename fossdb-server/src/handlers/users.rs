@@ -11,7 +11,6 @@ use serde_json::Value;
 use fossdb::SubscribeResponse;
 
 use crate::db::Database;
-use crate::handlers::packages::package_lookalike;
 use crate::lookalike::LookalikeTargets;
 use crate::middleware::AuthedUser;
 use crate::{AppState, PackageSubscription, SubscriptionRequest, SubscriptionResponse};
@@ -188,8 +187,8 @@ pub fn subscribe(
         db.update_user(user.clone())?;
     }
 
-    let lookalike = match package_lookalike(db, lookalikes, package.id) {
-        Ok(found) => found.flatten(),
+    let lookalike = match lookalikes.check(db, &package) {
+        Ok(found) => found,
         Err(e) => {
             tracing::warn!("lookalike check of {package_name} failed: {e}");
             None

@@ -7,7 +7,7 @@
 //! [`REFRESH_INTERVAL`].
 
 use anyhow::Result;
-use fossdb::typosquat::{lookalike_of, SquatReason};
+use fossdb::typosquat::{lookalike_of, PackageLookalike, SquatReason};
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -35,12 +35,6 @@ pub struct Target {
     /// Dependents: the larger of what the collector reported and the number
     /// of stored packages whose versions depend on it.
     pub popularity: u32,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Lookalike {
-    pub target: Target,
-    pub reason: SquatReason,
 }
 
 struct PlatformTargets {
@@ -77,7 +71,11 @@ impl LookalikeTargets {
     ///
     /// A candidate popular enough to be a target itself is never reported:
     /// two established packages with similar names are not a new threat.
-    pub fn check(&self, db: &Database, candidate: &fossdb::Package) -> Result<Option<Lookalike>> {
+    pub fn check(
+        &self,
+        db: &Database,
+        candidate: &fossdb::Package,
+    ) -> Result<Option<PackageLookalike>> {
         let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if cache
             .as_ref()
@@ -111,11 +109,13 @@ impl LookalikeTargets {
             .targets
             .iter()
             .find(|t| t.name == found.target)
-            .expect("lookalike_of returns one of the names it was given")
-            .clone();
-        Ok(Some(Lookalike {
-            target,
+            .expect("lookalike_of returns one of the names it was given");
+        Ok(Some(PackageLookalike {
+            target_id: target.id,
+            target_name: target.name.clone(),
+            target_dependents: target.popularity,
             reason: found.reason,
+            severity: found.reason.severity(),
         }))
     }
 }
