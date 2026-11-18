@@ -202,6 +202,12 @@ pub enum EventType {
     SecurityAlert,
     PackageAdded,
     PackageUpdated,
+    /// A release behaves differently from the last analysed one in a way
+    /// subscribers should know about, without that being a vulnerability by
+    /// itself, e.g. it newly runs code at install time.
+    ///
+    /// Kept last: stored events encode the variant by position.
+    BehaviorChange,
 }
 
 pub type TimelineEventType = EventType;

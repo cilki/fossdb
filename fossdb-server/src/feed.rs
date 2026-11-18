@@ -54,6 +54,12 @@ fn entry_title(event: &TimelineEvent) -> String {
     if event.event_type == crate::EventType::SecurityAlert {
         return format!("Security advisory for {}", event.package_name);
     }
+    if event.event_type == crate::EventType::BehaviorChange {
+        return match &event.version {
+            Some(version) => format!("Behavior change in {} {}", event.package_name, version),
+            None => format!("Behavior change in {}", event.package_name),
+        };
+    }
     match &event.version {
         Some(version) => format!("{} {}", event.package_name, version),
         None => event.package_name.clone(),
@@ -236,6 +242,16 @@ mod tests {
 
         assert!(feed.body.contains("<title>Security advisory for openssl</title>"), "{}", feed.body);
         assert!(feed.body.contains("RUSTSEC-2016-0001 (High): MitM. Affects 0.8.3."));
+    }
+
+    #[test]
+    fn behavior_changes_are_titled_as_such() {
+        let mut change = event(1, "left-pad", "1.3.1", 1);
+        change.inner.event_type = EventType::BehaviorChange;
+
+        let feed = render_rss(&ctx(std::slice::from_ref(&change)));
+
+        assert!(feed.body.contains("<title>Behavior change in left-pad 1.3.1</title>"), "{}", feed.body);
     }
 
     #[test]
