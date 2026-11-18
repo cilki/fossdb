@@ -488,6 +488,44 @@ pub enum FindingSeverity {
     Critical,
 }
 
+/// The install-time hooks of a package's most recently analysed version,
+/// compared with the version analysed before it. Served by
+/// `GET /api/packages/{id}/install-hooks`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PackageInstallHooks {
+    /// The analysed version the hooks belong to.
+    pub version: String,
+    pub analyzed_at: DateTime<Utc>,
+    /// The previously analysed version the hooks were compared with, or
+    /// `None` when this is the package's first analysis. The worker only
+    /// analyses each package's latest version, so this is not necessarily the
+    /// preceding release.
+    pub baseline_version: Option<String>,
+    pub hooks: Vec<InstallHook>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct InstallHook {
+    /// The hook relative to the package root, e.g.
+    /// `package.json:scripts.postinstall` or `build.rs`.
+    pub location: Option<String>,
+    pub description: String,
+    pub severity: FindingSeverity,
+    /// How the hook differs from the baseline: `None` when it is unchanged, or
+    /// when there is no baseline to compare with.
+    pub change: Option<InstallHookChange>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum InstallHookChange {
+    /// The baseline had no hook at this location.
+    Added,
+    /// The baseline had a hook at this location with a different description
+    /// or severity, e.g. its script changed.
+    Changed,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum WebSocketMessage {

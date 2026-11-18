@@ -68,6 +68,25 @@ fn advisory_url(source_id: &str) -> Option<String> {
     ))
 }
 
+fn finding_severity_classes(severity: &FindingSeverity) -> &'static str {
+    match severity {
+        FindingSeverity::Info => "bg-gray-700 text-gray-300",
+        FindingSeverity::Low => "bg-gray-600 text-gray-200",
+        FindingSeverity::Medium => "bg-yellow-900 text-yellow-300",
+        FindingSeverity::High => "bg-orange-900 text-orange-300",
+        FindingSeverity::Critical => "bg-red-900 text-red-300",
+    }
+}
+
+/// E.g. `New since 1.3.0`, for a hook that differs from the baseline.
+fn hook_change_label(change: Option<InstallHookChange>, baseline: Option<&str>) -> Option<String> {
+    let baseline = baseline?;
+    match change? {
+        InstallHookChange::Added => Some(format!("New since {baseline}")),
+        InstallHookChange::Changed => Some(format!("Changed since {baseline}")),
+    }
+}
+
 #[component]
 pub fn PackageDetail(id: String) -> Element {
     let auth = use_auth();
@@ -76,6 +95,7 @@ pub fn PackageDetail(id: String) -> Element {
     let mut displayed_versions = use_signal(|| Vec::<PackageVersion>::new());
     let mut subscribers = use_signal(|| 0usize);
     let mut advisories = use_signal(|| Vec::<PackageVulnerability>::new());
+    let mut install_hooks = use_signal(|| None::<PackageInstallHooks>);
     let mut loading = use_signal(|| true);
     let mut is_subscribed = use_signal(|| false);
     let mut notifications_enabled = use_signal(|| false);
@@ -131,6 +151,15 @@ pub fn PackageDetail(id: String) -> Element {
                     .get_package_vulnerabilities(&pkg_id)
                     .await
                     .unwrap_or_default(),
+            );
+
+            // Likewise: without an analysis the section is simply not shown.
+            install_hooks.set(
+                client
+                    .get_package_install_hooks(&pkg_id)
+                    .await
+                    .ok()
+                    .flatten(),
             );
 
             subscribers.set(client.get_package_subscribers(&pkg_id).await.unwrap_or(0));
@@ -497,6 +526,41 @@ pub fn PackageDetail(id: String) -> Element {
                                     }
                                 }
 
+                                if let Some(analysis) = install_hooks() {
+                                    div { class: "bg-gray-800 rounded-2xl shadow-xl p-6 border border-gray-700",
+                                        h3 { class: "text-lg font-bold text-gray-100 mb-1", "Install hooks" }
+                                        div { class: "text-xs text-gray-400 mb-4",
+                                            "Code that runs when {analysis.version} is installed or built"
+                                        }
+                                        if analysis.hooks.is_empty() {
+                                            div { class: "text-sm text-gray-400", "None found" }
+                                        }
+                                        div { class: "space-y-3",
+                                            for hook in analysis.hooks.iter() {
+                                                div {
+                                                    key: "{hook.location.as_deref().unwrap_or_default()}",
+                                                    class: "text-sm",
+                                                    div { class: "flex flex-wrap items-center gap-2 mb-1",
+                                                        span {
+                                                            class: "px-2 py-0.5 rounded text-xs font-medium {finding_severity_classes(&hook.severity)}",
+                                                            "{hook.severity:?}"
+                                                        }
+                                                        if let Some(label) = hook_change_label(hook.change, analysis.baseline_version.as_deref()) {
+                                                            span { class: "px-2 py-0.5 rounded text-xs font-medium bg-purple-900 text-purple-300",
+                                                                "{label}"
+                                                            }
+                                                        }
+                                                    }
+                                                    if let Some(location) = &hook.location {
+                                                        div { class: "font-mono text-xs text-gray-300 break-all", "{location}" }
+                                                    }
+                                                    div { class: "text-gray-400 break-words", "{hook.description}" }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
                                 // Package Info
                                 div { class: "bg-gray-800 rounded-2xl shadow-xl p-6 border border-gray-700",
                                     h3 { class: "text-lg font-bold text-gray-100 mb-4", "Information" }
@@ -600,5 +664,20 @@ mod tests {
         );
         assert_eq!(advisory_url("fossdb-7"), None);
         assert_eq!(advisory_url(""), None);
+    }
+
+    #[test]
+    fn hook_changes_name_the_baseline() {
+        assert_eq!(
+            hook_change_label(Some(InstallHookChange::Added), Some("1.3.0")).as_deref(),
+            Some("New since 1.3.0")
+        );
+        assert_eq!(
+            hook_change_label(Some(InstallHookChange::Changed), Some("1.3.0")).as_deref(),
+            Some("Changed since 1.3.0")
+        );
+        assert_eq!(hook_change_label(None, Some("1.3.0")), None);
+        // A first analysis has nothing to be new relative to.
+        assert_eq!(hook_change_label(Some(InstallHookChange::Added), None), None);
     }
 }

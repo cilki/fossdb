@@ -246,6 +246,7 @@ async fn start_server(config: Config) -> Result<()> {
         .route("/api/packages/{id}", get(handlers::packages::get_package))
         .route("/api/packages/{id}/versions", get(handlers::packages::get_package_versions))
         .route("/api/packages/{id}/vulnerabilities", get(handlers::packages::get_package_vulnerabilities))
+        .route("/api/packages/{id}/install-hooks", get(handlers::packages::get_package_install_hooks))
         .route("/api/packages/{id}/subscribers", get(handlers::packages::get_package_subscriber_count))
         .route("/api/auth/register", post(handlers::auth::register))
         .route("/api/auth/login", post(handlers::auth::login))

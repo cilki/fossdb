@@ -4,11 +4,13 @@ use axum::{
     response::Json,
 };
 use chrono::Utc;
-use fossdb::PackageVulnerability;
+use fossdb::{FindingKind, InstallHook, InstallHookChange, PackageInstallHooks, PackageVulnerability};
 use serde::Deserialize;
 use serde_json::Value;
+use std::collections::HashMap;
 
 use crate::db::Database;
+use crate::db_listener::install_hook_changes;
 use crate::{AppState, Package, PackageVersion, CreatePackageRequest};
 
 #[derive(Debug, Deserialize)]
@@ -225,6 +227,86 @@ pub fn package_vulnerabilities(
         .collect();
     list.sort_by(|a, b| b.vulnerability.discovered_at.cmp(&a.vulnerability.discovered_at));
     Ok(Some(list))
+}
+
+/// `null` when the package exists but no worker has analysed it yet.
+pub async fn get_package_install_hooks(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<Option<PackageInstallHooks>>, StatusCode> {
+    let id = id.parse::<u64>().map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    let result = state.db.get_package(id).and_then(|package| match package {
+        Some(_) => package_install_hooks(&state.db, id).map(Some),
+        None => Ok(None),
+    });
+    match result {
+        Ok(Some(hooks)) => Ok(Json(hooks)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => {
+            tracing::error!("Failed to list install hooks of package {}: {}", id, e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// The install hooks of the package's most recently analysed version, marked
+/// against the analysis before it the same way subscribers are alerted (see
+/// [`emit_install_hook_changes`](crate::db_listener::emit_install_hook_changes)),
+/// or `None` if the package has no analysis.
+pub fn package_install_hooks(
+    db: &Database,
+    package_id: u64,
+) -> anyhow::Result<Option<PackageInstallHooks>> {
+    let mut analyses = db.get_analyses_by_package(package_id)?;
+    analyses.sort_by_key(|a| (a.version_id, a.id));
+    let Some(latest) = analyses.pop() else {
+        return Ok(None);
+    };
+    let baseline = analyses
+        .into_iter()
+        .rev()
+        .find(|a| a.version_id < latest.version_id);
+
+    let changes: HashMap<Option<&str>, InstallHookChange> = baseline
+        .as_ref()
+        .map(|b| install_hook_changes(&b.findings, &latest.findings))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|c| {
+            let change = if c.added {
+                InstallHookChange::Added
+            } else {
+                InstallHookChange::Changed
+            };
+            (c.hook.location.as_deref(), change)
+        })
+        .collect();
+
+    let hooks = latest
+        .findings
+        .iter()
+        .filter(|f| f.kind == FindingKind::InstallHook)
+        .map(|f| InstallHook {
+            location: f.location.clone(),
+            description: f.description.clone(),
+            severity: f.severity.clone(),
+            change: changes.get(&f.location.as_deref()).copied(),
+        })
+        .collect();
+
+    let version_name = |id: u64| -> anyhow::Result<String> {
+        Ok(db
+            .get_version(id)?
+            .map(|v| v.inner.version)
+            .unwrap_or_else(|| format!("#{id}")))
+    };
+    Ok(Some(PackageInstallHooks {
+        version: version_name(latest.version_id)?,
+        analyzed_at: latest.analyzed_at,
+        baseline_version: baseline.map(|b| version_name(b.version_id)).transpose()?,
+        hooks,
+    }))
 }
 
 pub async fn get_package_subscriber_count(

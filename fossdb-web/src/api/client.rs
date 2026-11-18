@@ -200,6 +200,17 @@ impl ApiClient {
         .await
     }
 
+    /// Install hooks of the most recently analysed version, or `None` if the
+    /// package has not been analysed yet.
+    pub async fn get_package_install_hooks(&self, id: &str) -> Result<Option<PackageInstallHooks>> {
+        self.request(
+            "GET",
+            &format!("/packages/{}/install-hooks", encode_uri_component(id)),
+            None,
+        )
+        .await
+    }
+
     pub async fn get_package_subscribers(&self, id: &str) -> Result<usize> {
         // The server returns `{package_id, package_name, subscriber_count}`.
         // Deserializing a non-optional `count` field that does not exist made

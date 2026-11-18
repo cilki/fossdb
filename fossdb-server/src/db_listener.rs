@@ -699,4 +699,69 @@ mod tests {
              curl x | sh [suspicious: pipes into a shell]."
         );
     }
+
+    /// The package page's list marks hooks against the same baseline the
+    /// alerts use: the newest analysed version below the latest one.
+    #[test]
+    fn package_install_hooks_marks_changes_since_the_baseline() {
+        use crate::handlers::packages::package_install_hooks;
+        use fossdb::InstallHookChange;
+
+        let f = fixture();
+        assert_eq!(package_install_hooks(&f.db, f.package_id).unwrap(), None);
+
+        let gyp = hook("binding.gyp", "npm install: node-gyp rebuild", FindingSeverity::Low);
+        f.analyse(0, vec![hook(POSTINSTALL, "npm postinstall: echo", FindingSeverity::Low)]);
+        f.analyse(1, vec![gyp.clone(), hook(POSTINSTALL, "npm postinstall: tsc", FindingSeverity::Low)]);
+
+        let first = package_install_hooks(&f.db, f.package_id).unwrap().unwrap();
+        assert_eq!(first.version, "1.1.0");
+        assert_eq!(first.baseline_version.as_deref(), Some("1.0.0"));
+        let changes: Vec<_> = first
+            .hooks
+            .iter()
+            .map(|h| (h.location.as_deref().unwrap(), h.change))
+            .collect();
+        assert_eq!(
+            changes,
+            vec![
+                ("binding.gyp", Some(InstallHookChange::Added)),
+                (POSTINSTALL, Some(InstallHookChange::Changed)),
+            ]
+        );
+
+        // Analysed out of order: the latest version still wins, and it is
+        // compared with 1.1.0, not with the analysis stored just before it.
+        let license = AnalysisFinding {
+            kind: FindingKind::LicenseDetected,
+            severity: FindingSeverity::Info,
+            description: "MIT".into(),
+            location: Some("LICENSE".into()),
+        };
+        f.analyse(2, vec![license, gyp]);
+        f.analyse(0, Vec::new());
+
+        let latest = package_install_hooks(&f.db, f.package_id).unwrap().unwrap();
+        assert_eq!(latest.version, "1.2.0");
+        assert_eq!(latest.baseline_version.as_deref(), Some("1.1.0"));
+        assert_eq!(latest.hooks.len(), 1, "only InstallHook findings are listed");
+        assert_eq!(latest.hooks[0].location.as_deref(), Some("binding.gyp"));
+        assert_eq!(latest.hooks[0].change, None, "unchanged since 1.1.0");
+
+        let json = serde_json::to_value(&first).unwrap();
+        assert_eq!(json["hooks"][0]["change"], "added");
+    }
+
+    #[test]
+    fn first_analysis_has_no_baseline_and_no_changes() {
+        use crate::handlers::packages::package_install_hooks;
+
+        let f = fixture();
+        f.analyse(1, vec![hook("setup.py", "Python setup.py", FindingSeverity::Low)]);
+
+        let hooks = package_install_hooks(&f.db, f.package_id).unwrap().unwrap();
+        assert_eq!(hooks.version, "1.1.0");
+        assert_eq!(hooks.baseline_version, None);
+        assert_eq!(hooks.hooks[0].change, None);
+    }
 }
