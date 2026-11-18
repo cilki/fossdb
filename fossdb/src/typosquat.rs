@@ -67,6 +67,20 @@ pub struct SquatMatch {
     pub reason: SquatReason,
 }
 
+/// The popular package a stored package's name imitates. Served by
+/// `GET /api/packages/{id}/lookalike`, which applies the same rules as the
+/// alert raised when the package first arrived.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct PackageLookalike {
+    pub target_id: u64,
+    pub target_name: String,
+    /// The target's dependents, as used to rank it among its ecosystem's
+    /// most popular packages.
+    pub target_dependents: u32,
+    pub reason: SquatReason,
+    pub severity: FindingSeverity,
+}
+
 /// Lowercase, with `-`, `_` and `.` all mapped to `-` (PEP 503).
 pub fn normalize(name: &str) -> String {
     name.chars()

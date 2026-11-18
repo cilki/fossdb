@@ -1,4 +1,5 @@
 use crate::api::{client::encode_uri_component, types::*, ApiClient};
+use fossdb::typosquat::PackageLookalike;
 use crate::hooks::{use_auth, use_notifications};
 use dioxus::prelude::*;
 use std::collections::HashMap;
@@ -87,6 +88,19 @@ fn hook_change_label(change: Option<InstallHookChange>, baseline: Option<&str>) 
     }
 }
 
+/// E.g. `This name resembles colorama (one character different), which has
+/// 5000 dependents.`
+/// Targets always have several dependents (`MIN_TARGET_POPULARITY` on the
+/// server), so the count is never singular.
+fn lookalike_warning(lookalike: &PackageLookalike) -> String {
+    format!(
+        "This name resembles {} ({}), which has {} dependents.",
+        lookalike.target_name,
+        lookalike.reason.describe(),
+        lookalike.target_dependents
+    )
+}
+
 #[component]
 pub fn PackageDetail(id: String) -> Element {
     let auth = use_auth();
@@ -96,6 +110,7 @@ pub fn PackageDetail(id: String) -> Element {
     let mut subscribers = use_signal(|| 0usize);
     let mut advisories = use_signal(|| Vec::<PackageVulnerability>::new());
     let mut install_hooks = use_signal(|| None::<PackageInstallHooks>);
+    let mut lookalike = use_signal(|| None::<PackageLookalike>);
     let mut loading = use_signal(|| true);
     let mut is_subscribed = use_signal(|| false);
     let mut notifications_enabled = use_signal(|| false);
@@ -157,6 +172,15 @@ pub fn PackageDetail(id: String) -> Element {
             install_hooks.set(
                 client
                     .get_package_install_hooks(&pkg_id)
+                    .await
+                    .ok()
+                    .flatten(),
+            );
+
+            // Likewise: no banner if the check fails.
+            lookalike.set(
+                client
+                    .get_package_lookalike(&pkg_id)
                     .await
                     .ok()
                     .flatten(),
@@ -351,6 +375,28 @@ pub fn PackageDetail(id: String) -> Element {
                                         class: "px-4 py-2 bg-gray-700 hover:bg-gray-600 text-white rounded-lg transition-colors",
                                         "Repository"
                                     }
+                                }
+                            }
+                        }
+
+                        if let Some(lookalike) = lookalike() {
+                            div { class: "bg-gray-800 rounded-2xl shadow-xl p-6 mb-6 border border-yellow-700",
+                                div { class: "flex flex-wrap items-center gap-2 mb-2",
+                                    span {
+                                        class: "px-2 py-0.5 rounded text-xs font-medium {finding_severity_classes(&lookalike.severity)}",
+                                        "{lookalike.severity:?}"
+                                    }
+                                    h3 { class: "text-lg font-bold text-yellow-300", "Possible lookalike name" }
+                                }
+                                p { class: "text-gray-300", "{lookalike_warning(&lookalike)}" }
+                                p { class: "text-sm text-gray-400 mt-2",
+                                    "If you meant "
+                                    Link {
+                                        to: crate::Route::PackageDetail { id: lookalike.target_id.to_string() },
+                                        class: "font-mono text-blue-400 hover:text-blue-300",
+                                        "{lookalike.target_name}"
+                                    }
+                                    ", check your manifests before installing this package."
                                 }
                             }
                         }
@@ -679,5 +725,20 @@ mod tests {
         assert_eq!(hook_change_label(None, Some("1.3.0")), None);
         // A first analysis has nothing to be new relative to.
         assert_eq!(hook_change_label(Some(InstallHookChange::Added), None), None);
+    }
+
+    #[test]
+    fn lookalike_warning_names_the_target_and_reason() {
+        let lookalike = PackageLookalike {
+            target_id: 7,
+            target_name: "colorama".into(),
+            target_dependents: 5000,
+            reason: fossdb::typosquat::SquatReason::Edit1,
+            severity: FindingSeverity::Medium,
+        };
+        assert_eq!(
+            lookalike_warning(&lookalike),
+            "This name resembles colorama (one character different), which has 5000 dependents."
+        );
     }
 }

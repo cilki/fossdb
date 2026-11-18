@@ -4,6 +4,7 @@ use axum::{
     response::Json,
 };
 use chrono::Utc;
+use fossdb::typosquat::PackageLookalike;
 use fossdb::{FindingKind, InstallHook, InstallHookChange, PackageInstallHooks, PackageVulnerability};
 use serde::Deserialize;
 use serde_json::Value;
@@ -11,6 +12,7 @@ use std::collections::HashMap;
 
 use crate::db::Database;
 use crate::db_listener::install_hook_changes;
+use crate::lookalike::LookalikeTargets;
 use crate::{AppState, Package, PackageVersion, CreatePackageRequest};
 
 #[derive(Debug, Deserialize)]
@@ -307,6 +309,48 @@ pub fn package_install_hooks(
         baseline_version: baseline.map(|b| version_name(b.version_id)).transpose()?,
         hooks,
     }))
+}
+
+/// `null` when the package's name imitates none of the popular packages of
+/// its ecosystem.
+pub async fn get_package_lookalike(
+    Path(id): Path<String>,
+    State(state): State<AppState>,
+) -> Result<Json<Option<PackageLookalike>>, StatusCode> {
+    let id = id.parse::<u64>().map_err(|_| StatusCode::BAD_REQUEST)?;
+
+    match package_lookalike(&state.db, &state.lookalikes, id) {
+        Ok(Some(lookalike)) => Ok(Json(lookalike)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => {
+            tracing::error!("Lookalike check of package {} failed: {}", id, e);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
+    }
+}
+
+/// The popular package `package_id`'s name imitates, judged exactly as
+/// [`store_package`](crate::handlers::collector::store_package) judges a new
+/// arrival, or `None` if there is no such package.
+///
+/// Running the check on read rather than storing its result on arrival also
+/// covers packages stored before lookalike detection existed, and drops the
+/// warning once the package has become popular itself.
+pub fn package_lookalike(
+    db: &Database,
+    lookalikes: &LookalikeTargets,
+    package_id: u64,
+) -> anyhow::Result<Option<Option<PackageLookalike>>> {
+    let Some(package) = db.get_package(package_id)? else {
+        return Ok(None);
+    };
+    Ok(Some(lookalikes.check(db, &package)?.map(|l| PackageLookalike {
+        target_id: l.target.id,
+        target_name: l.target.name,
+        target_dependents: l.target.popularity,
+        reason: l.reason,
+        severity: l.reason.severity(),
+    })))
 }
 
 pub async fn get_package_subscriber_count(

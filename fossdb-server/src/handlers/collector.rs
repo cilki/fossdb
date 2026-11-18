@@ -784,6 +784,47 @@ mod tests {
     }
 
     #[test]
+    fn package_page_lookalike_matches_the_arrival_check() {
+        use crate::handlers::packages::package_lookalike;
+        use fossdb::typosquat::SquatReason;
+        use fossdb::FindingSeverity;
+
+        let (_dir, db) = open_db();
+        seed(
+            &db,
+            vec![
+                collected("colorama", "Pypi", Some(5000), &[]),
+                collected("colourama", "Pypi", Some(0), &[]),
+                collected("Colorama", "Pypi", Some(0), &[]),
+                collected("colorama-js", "Pypi", Some(0), &[]),
+                collected("termcolor", "Pypi", Some(0), &[]),
+            ],
+        );
+        let id = |name: &str| db.get_package_by_name(name).unwrap().unwrap().id;
+        let lookalikes = LookalikeTargets::new();
+        let check = |name: &str| package_lookalike(&db, &lookalikes, id(name)).unwrap().unwrap();
+
+        let found = check("colourama").expect("colourama imitates colorama");
+        assert_eq!(found.target_id, id("colorama"));
+        assert_eq!(found.target_name, "colorama");
+        assert_eq!(found.target_dependents, 5000);
+        assert_eq!(found.reason, SquatReason::Edit1);
+        assert_eq!(found.severity, FindingSeverity::Medium);
+
+        let affix = check("colorama-js").expect("an affix match is still reported");
+        assert_eq!(affix.severity, FindingSeverity::Low);
+
+        // The imitated package itself, a PEP 503 spelling of it, and an
+        // unrelated name are not lookalikes.
+        assert_eq!(check("colorama"), None);
+        assert_eq!(check("Colorama"), None);
+        assert_eq!(check("termcolor"), None);
+
+        // No such package: the handler answers 404 rather than `null`.
+        assert!(package_lookalike(&db, &lookalikes, 9999).unwrap().is_none());
+    }
+
+    #[test]
     fn unknown_package_is_skipped_and_not_stored() {
         let (_dir, db) = open_db();
 

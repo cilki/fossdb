@@ -211,6 +211,17 @@ impl ApiClient {
         .await
     }
 
+    /// The popular package this one's name imitates, or `None` if it
+    /// imitates none.
+    pub async fn get_package_lookalike(&self, id: &str) -> Result<Option<typosquat::PackageLookalike>> {
+        self.request(
+            "GET",
+            &format!("/packages/{}/lookalike", encode_uri_component(id)),
+            None,
+        )
+        .await
+    }
+
     pub async fn get_package_subscribers(&self, id: &str) -> Result<usize> {
         // The server returns `{package_id, package_name, subscriber_count}`.
         // Deserializing a non-optional `count` field that does not exist made
