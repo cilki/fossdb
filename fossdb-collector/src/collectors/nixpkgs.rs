@@ -5,7 +5,7 @@ use serde::Deserialize;
 use std::sync::Arc;
 use tokio::process::Command;
 
-use crate::client::CollectorClient;
+use crate::client::{CollectorClient, aborts_run};
 use crate::collectors::{Collector, helpers};
 
 #[derive(Debug, Deserialize)]
@@ -218,6 +218,7 @@ impl Collector for NixpkgsCollector {
             // stall every remaining package for a full interval.
             let existing = match client.get_package(&package_name).await {
                 Ok(existing) => existing,
+                Err(e) if aborts_run(&e) => return Err(e),
                 Err(e) => {
                     tracing::warn!("Lookup failed for {}: {}", package_name, e);
                     continue;
@@ -290,6 +291,7 @@ impl Collector for NixpkgsCollector {
                         version,
                         package_name
                     ),
+                    Err(e) if aborts_run(&e) => return Err(e),
                     Err(e) => {
                         tracing::error!("Failed to submit version for {}: {}", package_name, e)
                     }
@@ -360,6 +362,7 @@ impl Collector for NixpkgsCollector {
 
             match client.submit_package(pkg).await {
                 Ok(_) => tracing::info!("Submitted package: {}", package_name),
+                Err(e) if aborts_run(&e) => return Err(e),
                 Err(e) => tracing::error!("Failed to submit {}: {}", package_name, e),
             }
 

@@ -34,7 +34,7 @@ use std::collections::{HashMap, HashSet};
 use std::io::Read;
 use std::sync::Arc;
 
-use crate::client::CollectorClient;
+use crate::client::{CollectorClient, aborts_run};
 use crate::collectors::Collector;
 
 const OSV_BUCKET: &str = "https://osv-vulnerabilities.storage.googleapis.com";
@@ -144,6 +144,7 @@ impl Collector for OsvCollector {
                     Ok(lookup) => {
                         lookups.insert(name.to_string(), lookup);
                     }
+                    Err(e) if aborts_run(&e) => return Err(e),
                     Err(e) => {
                         tracing::warn!("Failed to look up package {}: {}", name, e);
                         lookup_failed = true;
@@ -177,6 +178,7 @@ impl Collector for OsvCollector {
                         tracing::debug!("Advisory {} skipped {:?}", id, result.skipped);
                     }
                 }
+                Err(e) if aborts_run(&e) => return Err(e),
                 Err(e) => {
                     failed += 1;
                     tracing::warn!("Failed to submit advisory {}: {}", id, e);

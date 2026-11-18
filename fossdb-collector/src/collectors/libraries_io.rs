@@ -6,7 +6,9 @@ use reqwest::{Client, Response};
 use serde::{Deserialize, Deserializer, de::DeserializeOwned};
 use std::sync::Arc;
 
-use crate::client::{AdaptiveConfig, AdaptiveRateLimitedClient, CollectorClient, percent_encode};
+use crate::client::{
+    AdaptiveConfig, AdaptiveRateLimitedClient, CollectorClient, aborts_run, percent_encode,
+};
 use crate::collectors::{Collector, helpers};
 
 /// Results requested per search page.
@@ -360,6 +362,7 @@ impl Collector for LibrariesIoCollector {
                     for pkg in packages {
                         match client.submit_package(pkg).await {
                             Ok(_) => {}
+                            Err(e) if aborts_run(&e) => return Err(e),
                             Err(e) => tracing::error!("Failed to submit package: {}", e),
                         }
 

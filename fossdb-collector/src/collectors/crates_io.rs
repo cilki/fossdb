@@ -5,7 +5,7 @@ use fossdb::{CollectedPackage, CollectedVersion};
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use crate::client::CollectorClient;
+use crate::client::{CollectorClient, aborts_run};
 use crate::collectors::{Collector, helpers};
 
 /// Maximum versions submitted per crate in one pass.
@@ -222,6 +222,9 @@ impl Collector for CratesIoCollector {
 
             for krate in &crates_page.crates {
                 if let Err(e) = self.process_crate(krate, &client).await {
+                    if aborts_run(&e) {
+                        return Err(e);
+                    }
                     tracing::warn!("Failed to process crate {}: {}", krate.name, e);
                 }
 

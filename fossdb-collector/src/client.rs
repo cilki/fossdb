@@ -38,6 +38,59 @@ pub(crate) fn percent_encode(value: &str) -> String {
     out
 }
 
+/// fossdb-server could not be reached, or it rejected the collector's API key.
+///
+/// Unlike a failure about one package, this repeats for every later request
+/// in the run, so collectors abort the run on it (see [`aborts_run`]) rather
+/// than logging one warning per item and then reporting the run as completed.
+#[derive(Debug)]
+pub struct ServerUnusable(reqwest::Error);
+
+impl std::fmt::Display for ServerUnusable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.0.status().is_some() {
+            write!(
+                f,
+                "fossdb-server rejected COLLECTOR_API_KEY ({}); it may be revoked, mistyped, \
+                 or a worker key. Mint one with `fossdb admin api-key create --role collector`",
+                self.0
+            )
+        } else {
+            write!(
+                f,
+                "cannot reach fossdb-server ({}); check SERVER_INTERNAL_URL",
+                self.0
+            )
+        }
+    }
+}
+
+impl std::error::Error for ServerUnusable {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.0)
+    }
+}
+
+/// Wrap a request error to fossdb-server, marking the ones that every later
+/// request would hit too.
+fn server_error(e: reqwest::Error) -> anyhow::Error {
+    let unusable = e.is_connect()
+        || matches!(
+            e.status(),
+            Some(reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN)
+        );
+    if unusable {
+        ServerUnusable(e).into()
+    } else {
+        e.into()
+    }
+}
+
+/// Whether `e` means the rest of the collection run cannot succeed either.
+pub fn aborts_run(e: &anyhow::Error) -> bool {
+    e.downcast_ref::<ServerUnusable>().is_some()
+}
+
 pub struct CollectorClient {
     client: Client,
     base_url: String,
@@ -72,13 +125,18 @@ impl CollectorClient {
             ))
             .header("Authorization", self.auth_header())
             .send()
-            .await?;
+            .await
+            .map_err(server_error)?;
 
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
 
-        let lookup: PackageLookup = resp.error_for_status()?.json().await?;
+        let lookup: PackageLookup = resp
+            .error_for_status()
+            .map_err(server_error)?
+            .json()
+            .await?;
         Ok(Some(lookup))
     }
 
@@ -89,9 +147,14 @@ impl CollectorClient {
             .header("Authorization", self.auth_header())
             .json(&pkg)
             .send()
-            .await?;
+            .await
+            .map_err(server_error)?;
 
-        let package: Package = resp.error_for_status()?.json().await?;
+        let package: Package = resp
+            .error_for_status()
+            .map_err(server_error)?
+            .json()
+            .await?;
         Ok(package)
     }
 
@@ -106,9 +169,14 @@ impl CollectorClient {
             .header("Authorization", self.auth_header())
             .json(advisory)
             .send()
-            .await?;
+            .await
+            .map_err(server_error)?;
 
-        Ok(resp.error_for_status()?.json().await?)
+        Ok(resp
+            .error_for_status()
+            .map_err(server_error)?
+            .json()
+            .await?)
     }
 
     pub async fn update_package_timestamp(
@@ -130,8 +198,10 @@ impl CollectorClient {
             .header("Authorization", self.auth_header())
             .json(&Body { updated_at })
             .send()
-            .await?
-            .error_for_status()?;
+            .await
+            .map_err(server_error)?
+            .error_for_status()
+            .map_err(server_error)?;
         Ok(())
     }
 }
@@ -253,6 +323,54 @@ impl AdaptiveRateLimitedClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Serve one canned HTTP response with `status` on a loopback port and
+    /// return a client pointed at it.
+    async fn client_answered_with(status: &'static str) -> CollectorClient {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = socket.read(&mut buf).await;
+            let response =
+                format!("HTTP/1.1 {status}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        CollectorClient::new(url, "key".to_string()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn rejected_key_aborts_the_run() {
+        let client = client_answered_with("401 Unauthorized").await;
+        let err = client.get_package("serde").await.unwrap_err();
+        assert!(aborts_run(&err), "{err}");
+        assert!(err.to_string().contains("COLLECTOR_API_KEY"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn unreachable_server_aborts_the_run() {
+        // Bind and drop to get a loopback port nothing listens on.
+        let port = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let client =
+            CollectorClient::new(format!("http://127.0.0.1:{port}"), "key".into()).unwrap();
+        let err = client.get_package("serde").await.unwrap_err();
+        assert!(aborts_run(&err), "{err}");
+        assert!(err.to_string().contains("SERVER_INTERNAL_URL"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn server_error_about_one_package_does_not_abort_the_run() {
+        let client = client_answered_with("500 Internal Server Error").await;
+        let err = client.get_package("serde").await.unwrap_err();
+        assert!(!aborts_run(&err), "{err}");
+    }
 
     #[test]
     fn percent_encodes_utf8_bytes() {
