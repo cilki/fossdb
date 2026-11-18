@@ -113,8 +113,19 @@ pub fn store_package(
         }
     };
 
+    // Insert oldest first. Version ids are assigned in insertion order, and the
+    // rest of the server reads a higher id as a newer release: the worker is
+    // handed each package's highest-id version as its "latest", and install
+    // hook alerts compare against the highest analysed id below it. Collectors
+    // do not agree on an order - crates.io lists newest first - so taking the
+    // batch as sent made the worker analyse the *oldest* collected release of
+    // every new crate and never the current one. The sort is stable, so
+    // versions sharing a date keep the order they were sent in.
+    let mut versions = collected.versions;
+    versions.sort_by_key(|v| v.release_date);
+
     // Each insert is announced by the PackageVersion watch in db_listener.
-    for v in collected.versions {
+    for v in versions {
         if known_versions.contains(&v.version) {
             continue;
         }
@@ -668,6 +679,56 @@ mod tests {
         for p in packages {
             store_package(db, &TimelineBroadcaster::new(), &LookalikeTargets::new(), p).unwrap();
         }
+    }
+
+    /// Versions submitted newest first (as crates.io lists them) must still get
+    /// ids in release order, both on first ingest and when new releases arrive
+    /// for a known package, since a higher id is read as a newer release.
+    #[test]
+    fn versions_get_ids_in_release_order() {
+        let (_dir, db) = open_db();
+        let base = Utc::now() - chrono::Duration::days(30);
+        let batch = |versions: &[(&str, i64)]| {
+            let mut package = collected("serde", "crates.io", None, &[]);
+            package.versions = versions
+                .iter()
+                .map(|(version, day)| fossdb::CollectedVersion {
+                    version: (*version).into(),
+                    release_date: base + chrono::Duration::days(*day),
+                    download_url: None,
+                    checksum: None,
+                    dependencies: Vec::new(),
+                    changelog: None,
+                })
+                .collect();
+            package
+        };
+        let order = |db: &Database, id: u64| -> Vec<String> {
+            let mut versions = db.get_versions_by_package(id).unwrap();
+            versions.sort_by_key(|v| v.id);
+            versions.into_iter().map(|v| v.inner.version).collect()
+        };
+
+        let package = store_package(
+            &db,
+            &TimelineBroadcaster::new(),
+            &LookalikeTargets::new(),
+            batch(&[("1.2.0", 2), ("1.1.0", 1), ("1.0.0", 0)]),
+        )
+        .unwrap();
+        assert_eq!(order(&db, package.id), ["1.0.0", "1.1.0", "1.2.0"]);
+
+        store_package(
+            &db,
+            &TimelineBroadcaster::new(),
+            &LookalikeTargets::new(),
+            batch(&[("1.4.0", 4), ("1.3.0", 3), ("1.2.0", 2)]),
+        )
+        .unwrap();
+        assert_eq!(
+            order(&db, package.id),
+            ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"]
+        );
     }
 
     #[test]
