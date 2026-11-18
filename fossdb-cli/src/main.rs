@@ -310,13 +310,32 @@ async fn subscriptions(args: &Args) -> Result<()> {
 
 async fn subscribe(args: &Args, package: &str) -> Result<()> {
     let (client, _) = authed_client(args)?;
-    let subscriptions = client.subscribe(package).await?;
+    let response = client.subscribe(package).await?;
 
     if !args.json {
         println!("Subscribed to {package}.");
     }
-    print_subscriptions(args, &subscriptions);
+    print_subscriptions(args, &response.subscriptions);
+
+    // On stderr, so `--json` output stays parseable and scripts still see it.
+    if let Some(lookalike) = &response.lookalike {
+        eprintln!();
+        eprintln!("{}", lookalike_warning(package, lookalike));
+    }
     Ok(())
+}
+
+/// Warn that `package` is likely a typo for the popular package it imitates.
+/// The subscription is kept: following a suspected squat can be deliberate.
+fn lookalike_warning(package: &str, lookalike: &fossdb::typosquat::PackageLookalike) -> String {
+    let target = &lookalike.target_name;
+    format!(
+        "warning: `{package}` resembles `{target}` ({}), which has {} dependents.\n\
+         If you meant {target}, switch with:\n  \
+         fossdb unsubscribe {package} && fossdb subscribe {target}",
+        lookalike.reason.describe(),
+        lookalike.target_dependents,
+    )
 }
 
 async fn unsubscribe(args: &Args, package: &str) -> Result<()> {
@@ -749,6 +768,39 @@ mod fossdb_admin_types {
         pub accounts: usize,
         pub timeline_events: usize,
         pub analyses: usize,
+    }
+}
+
+#[cfg(test)]
+mod subscribe_tests {
+    use super::*;
+    use fossdb::typosquat::{PackageLookalike, SquatReason};
+
+    #[test]
+    fn lookalike_warning_names_the_target_and_how_to_switch() {
+        let lookalike = PackageLookalike {
+            target_id: 12,
+            target_name: "colorama".into(),
+            target_dependents: 5000,
+            reason: SquatReason::Edit1,
+            severity: SquatReason::Edit1.severity(),
+        };
+
+        assert_eq!(
+            lookalike_warning("colourama", &lookalike),
+            "warning: `colourama` resembles `colorama` (one character different), \
+             which has 5000 dependents.\n\
+             If you meant colorama, switch with:\n  \
+             fossdb unsubscribe colourama && fossdb subscribe colorama"
+        );
+    }
+
+    #[test]
+    fn subscribe_reply_without_lookalike_still_parses() {
+        // A server predating the field replies with only the subscriptions.
+        let response: fossdb::SubscribeResponse =
+            serde_json::from_str(r#"{"subscriptions":[]}"#).unwrap();
+        assert!(response.lookalike.is_none());
     }
 }
 

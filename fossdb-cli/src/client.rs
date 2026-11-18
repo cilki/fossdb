@@ -4,7 +4,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 use fossdb::{
-    AuthResponse, PackageSubscription, RegisterResponse, SubscriptionRequest, SubscriptionResponse,
+    AuthResponse, PackageSubscription, RegisterResponse, SubscribeResponse, SubscriptionRequest,
+    SubscriptionResponse,
 };
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -132,7 +133,7 @@ impl Client {
         Ok(body.subscriptions)
     }
 
-    pub async fn subscribe(&self, package_name: &str) -> Result<Vec<PackageSubscription>> {
+    pub async fn subscribe(&self, package_name: &str) -> Result<SubscribeResponse> {
         let response = self
             .authed(self.http.post(self.url("/api/users/subscriptions")))
             .json(&SubscriptionRequest {
@@ -142,17 +143,15 @@ impl Client {
             .await
             .with_context(|| format!("connecting to {}", self.server))?;
 
-        let body: SubscriptionResponse = self
-            .decode(
-                response,
-                &format!("subscribing to {package_name}"),
-                &format!(
-                    "this server knows no package named `{package_name}` \
-                     (names must match exactly, including case)"
-                ),
-            )
-            .await?;
-        Ok(body.subscriptions)
+        self.decode(
+            response,
+            &format!("subscribing to {package_name}"),
+            &format!(
+                "this server knows no package named `{package_name}` \
+                 (names must match exactly, including case)"
+            ),
+        )
+        .await
     }
 
     pub async fn unsubscribe(&self, package_name: &str) -> Result<Vec<PackageSubscription>> {

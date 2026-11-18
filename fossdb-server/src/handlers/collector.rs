@@ -926,6 +926,50 @@ mod tests {
     }
 
     #[test]
+    fn subscribing_to_a_lookalike_succeeds_and_names_the_target() {
+        use crate::handlers::users::subscribe;
+
+        let (_dir, db) = open_db();
+        seed(
+            &db,
+            vec![
+                collected("colorama", "Pypi", Some(5000), &[]),
+                collected("colourama", "Pypi", Some(0), &[]),
+            ],
+        );
+        let lookalikes = LookalikeTargets::new();
+        let account = |subscriptions: Vec<fossdb::PackageSubscription>| crate::User {
+            inner: fossdb::User {
+                user_id: "subscriber".into(),
+                subscriptions,
+                created_at: Utc::now(),
+                notifications_enabled: true,
+            },
+        };
+        db.insert_user(account(Vec::new())).unwrap();
+
+        let response = subscribe(&db, &lookalikes, account(Vec::new()), "colourama")
+            .unwrap()
+            .expect("colourama exists");
+        let lookalike = response.lookalike.expect("colourama imitates colorama");
+        assert_eq!(lookalike.target_name, "colorama");
+        assert_eq!(lookalike.target_dependents, 5000);
+        // A warning, not a refusal: the subscription is stored.
+        assert_eq!(response.subscriptions.len(), 1);
+        assert_eq!(response.subscriptions[0].package_name, "colourama");
+        let stored = db.get_user("subscriber").unwrap().unwrap();
+        assert_eq!(stored.subscriptions, response.subscriptions);
+
+        let response = subscribe(&db, &lookalikes, stored.clone(), "colorama")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.lookalike, None);
+        assert_eq!(response.subscriptions.len(), 2);
+
+        assert!(subscribe(&db, &lookalikes, stored, "nonexistent").unwrap().is_none());
+    }
+
+    #[test]
     fn unknown_package_is_skipped_and_not_stored() {
         let (_dir, db) = open_db();
 

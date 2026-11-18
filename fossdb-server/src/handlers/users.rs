@@ -8,6 +8,11 @@ use serde_json::Value;
 
 // `SubscriptionRequest`/`SubscriptionResponse` come from the shared `fossdb`
 // crate so the client cannot drift out of sync with the wire format.
+use fossdb::SubscribeResponse;
+
+use crate::db::Database;
+use crate::handlers::packages::package_lookalike;
+use crate::lookalike::LookalikeTargets;
 use crate::middleware::AuthedUser;
 use crate::{AppState, PackageSubscription, SubscriptionRequest, SubscriptionResponse};
 
@@ -142,35 +147,58 @@ pub async fn add_subscription(
     State(state): State<AppState>,
     Extension(authed): Extension<AuthedUser>,
     Json(payload): Json<SubscriptionRequest>,
-) -> Result<Json<SubscriptionResponse>, StatusCode> {
-    let mut user = load_user(&state, &authed)?;
+) -> Result<Json<SubscribeResponse>, StatusCode> {
+    let user = load_user(&state, &authed)?;
 
-    if state
-        .db
-        .get_package_by_name(&payload.package_name)
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?
-        .is_none()
-    {
-        return Err(StatusCode::NOT_FOUND);
+    match subscribe(&state.db, &state.lookalikes, user, &payload.package_name) {
+        Ok(Some(response)) => Ok(Json(response)),
+        Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(e) => {
+            tracing::error!("subscribing to {} failed: {e}", payload.package_name);
+            Err(StatusCode::INTERNAL_SERVER_ERROR)
+        }
     }
+}
+
+/// Subscribe `user` to `package_name`, and report the popular package that
+/// name imitates so the client can warn about a likely typo. `None` when no
+/// package has that name.
+///
+/// Subscribing to a lookalike is still allowed: it may be deliberate (to
+/// watch a suspected squat), and a failed lookalike check never blocks it.
+pub fn subscribe(
+    db: &Database,
+    lookalikes: &LookalikeTargets,
+    mut user: crate::models::User,
+    package_name: &str,
+) -> anyhow::Result<Option<SubscribeResponse>> {
+    let Some(package) = db.get_package_by_name(package_name)? else {
+        return Ok(None);
+    };
 
     if !user
         .subscriptions
         .iter()
-        .any(|s| s.package_name == payload.package_name)
+        .any(|s| s.package_name == package_name)
     {
         user.subscriptions.push(PackageSubscription {
-            package_name: payload.package_name,
+            package_name: package_name.to_string(),
             notifications_enabled: true,
         });
-        state
-            .db
-            .update_user(user.clone())
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        db.update_user(user.clone())?;
     }
 
-    Ok(Json(SubscriptionResponse {
+    let lookalike = match package_lookalike(db, lookalikes, package.id) {
+        Ok(found) => found.flatten(),
+        Err(e) => {
+            tracing::warn!("lookalike check of {package_name} failed: {e}");
+            None
+        }
+    };
+
+    Ok(Some(SubscribeResponse {
         subscriptions: user.subscriptions.clone(),
+        lookalike,
     }))
 }
 

@@ -291,6 +291,20 @@ pub struct SubscriptionResponse {
     pub subscriptions: Vec<PackageSubscription>,
 }
 
+/// Body returned by `POST /users/subscriptions`: the account's subscriptions,
+/// plus the popular package the newly followed one's name imitates, if any.
+///
+/// A superset of [`SubscriptionResponse`], so clients that read the reply as
+/// one keep working.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubscribeResponse {
+    pub subscriptions: Vec<PackageSubscription>,
+    /// Lets a client warn that a subscription to e.g. `colourama` was meant
+    /// for `colorama`. Judged by the same rules as the package page's warning.
+    #[serde(default)]
+    pub lookalike: Option<typosquat::PackageLookalike>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimelineResponse {
     pub events: Vec<TimelineEvent>,
