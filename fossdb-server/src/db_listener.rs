@@ -1,10 +1,11 @@
 use anyhow::Result;
 use chrono::Utc;
+use fossdb::InstallHookChange;
 use native_db::watch::Event;
 use std::sync::Arc;
 
 use crate::db::Database;
-use crate::{EventType, PackageVersion, TimelineEvent};
+use crate::{EventType, PackageVersion, TimelineEvent, WorkerAnalysis};
 use crate::websocket::TimelineBroadcaster;
 
 /// Spawns a background task that listens for PackageVersion inserts
@@ -261,10 +262,28 @@ pub fn emit_lookalike_alert(
 /// have in the same form.
 #[derive(Debug, PartialEq)]
 pub struct HookChange<'a> {
-    /// `false` when the baseline had a hook at the same location, but with a
-    /// different description or severity (e.g. its script changed).
-    pub added: bool,
+    pub change: InstallHookChange,
     pub hook: &'a fossdb::AnalysisFinding,
+}
+
+/// The analysis `analysed` install hooks are compared with: the one of the
+/// highest version below `version_id`, the newest if it was analysed twice.
+pub fn baseline_analysis(
+    analysed: impl IntoIterator<Item = WorkerAnalysis>,
+    version_id: u64,
+) -> Option<WorkerAnalysis> {
+    analysed
+        .into_iter()
+        .filter(|a| a.version_id < version_id)
+        .max_by_key(|a| (a.version_id, a.id))
+}
+
+/// The version string of `version_id`, or `#<id>` if it is gone.
+pub fn version_name(db: &Database, version_id: u64) -> Result<String> {
+    Ok(db
+        .get_version(version_id)?
+        .map(|v| v.inner.version)
+        .unwrap_or_else(|| format!("#{version_id}")))
 }
 
 /// The `InstallHook` findings of `current` that are new or different compared
@@ -289,9 +308,9 @@ pub fn install_hook_changes<'a>(
 
     hooks(current)
         .filter_map(|hook| match before.get(&hook.location.as_deref()) {
-            None => Some(HookChange { added: true, hook }),
+            None => Some(HookChange { change: InstallHookChange::Added, hook }),
             Some(old) if old.description != hook.description || old.severity != hook.severity => {
-                Some(HookChange { added: false, hook })
+                Some(HookChange { change: InstallHookChange::Changed, hook })
             }
             Some(_) => None,
         })
@@ -316,12 +335,8 @@ pub fn emit_install_hook_changes(
     broadcaster: &TimelineBroadcaster,
     analysis: &fossdb::WorkerAnalysis,
 ) -> Result<()> {
-    let baseline = db
-        .get_analyses_by_package(analysis.package_id)?
-        .into_iter()
-        .filter(|a| a.version_id < analysis.version_id)
-        .max_by_key(|a| (a.version_id, a.id));
-    let Some(baseline) = baseline else {
+    let analysed = db.get_analyses_by_package(analysis.package_id)?;
+    let Some(baseline) = baseline_analysis(analysed, analysis.version_id) else {
         return Ok(());
     };
 
@@ -333,14 +348,8 @@ pub fn emit_install_hook_changes(
     let Some(package) = db.get_package(analysis.package_id)? else {
         return Ok(());
     };
-    let version_name = |id: u64| -> Result<String> {
-        Ok(db
-            .get_version(id)?
-            .map(|v| v.inner.version)
-            .unwrap_or_else(|| format!("#{id}")))
-    };
-    let version = version_name(analysis.version_id)?;
-    let baseline_version = version_name(baseline.version_id)?;
+    let version = version_name(db, analysis.version_id)?;
+    let baseline_version = version_name(db, baseline.version_id)?;
 
     let suspicious = changes.iter().any(|c| {
         matches!(
@@ -368,7 +377,7 @@ pub fn emit_install_hook_changes(
         "hooks": changes
             .iter()
             .map(|c| serde_json::json!({
-                "change": if c.added { "added" } else { "changed" },
+                "change": c.change,
                 "location": c.hook.location,
                 "description": c.hook.description,
                 "severity": c.hook.severity,
@@ -399,7 +408,10 @@ fn install_hook_message(version: &str, baseline: &str, changes: &[HookChange]) -
     let hooks = changes
         .iter()
         .map(|c| {
-            let change = if c.added { "added" } else { "changed" };
+            let change = match c.change {
+                InstallHookChange::Added => "added",
+                InstallHookChange::Changed => "changed",
+            };
             format!("{change} {}", c.hook.description.trim_end_matches('.'))
         })
         .collect::<Vec<_>>()
@@ -512,8 +524,8 @@ mod tests {
         assert_eq!(
             changes,
             vec![
-                HookChange { added: false, hook: &current[1] },
-                HookChange { added: true, hook: &current[3] },
+                HookChange { change: InstallHookChange::Changed, hook: &current[1] },
+                HookChange { change: InstallHookChange::Added, hook: &current[3] },
             ]
         );
         assert!(install_hook_changes(&current, &current).is_empty());

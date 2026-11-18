@@ -11,7 +11,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 
 use crate::db::Database;
-use crate::db_listener::install_hook_changes;
+use crate::db_listener::{baseline_analysis, install_hook_changes, version_name};
 use crate::lookalike::LookalikeTargets;
 use crate::{AppState, Package, PackageVersion, CreatePackageRequest};
 
@@ -256,36 +256,25 @@ pub async fn get_package_install_hooks(
 }
 
 /// The install hooks of the package's most recently analysed version, marked
-/// against the analysis before it the same way subscribers are alerted (see
+/// against the same baseline subscribers are alerted against (see
 /// [`emit_install_hook_changes`](crate::db_listener::emit_install_hook_changes)),
 /// or `None` if the package has no analysis.
 pub fn package_install_hooks(
     db: &Database,
     package_id: u64,
 ) -> anyhow::Result<Option<PackageInstallHooks>> {
-    let mut analyses = db.get_analyses_by_package(package_id)?;
-    analyses.sort_by_key(|a| (a.version_id, a.id));
-    let Some(latest) = analyses.pop() else {
+    let analyses = db.get_analyses_by_package(package_id)?;
+    let Some(latest) = analyses.iter().max_by_key(|a| (a.version_id, a.id)).cloned() else {
         return Ok(None);
     };
-    let baseline = analyses
-        .into_iter()
-        .rev()
-        .find(|a| a.version_id < latest.version_id);
+    let baseline = baseline_analysis(analyses, latest.version_id);
 
     let changes: HashMap<Option<&str>, InstallHookChange> = baseline
         .as_ref()
         .map(|b| install_hook_changes(&b.findings, &latest.findings))
         .unwrap_or_default()
         .into_iter()
-        .map(|c| {
-            let change = if c.added {
-                InstallHookChange::Added
-            } else {
-                InstallHookChange::Changed
-            };
-            (c.hook.location.as_deref(), change)
-        })
+        .map(|c| (c.hook.location.as_deref(), c.change))
         .collect();
 
     let hooks = latest
@@ -300,16 +289,10 @@ pub fn package_install_hooks(
         })
         .collect();
 
-    let version_name = |id: u64| -> anyhow::Result<String> {
-        Ok(db
-            .get_version(id)?
-            .map(|v| v.inner.version)
-            .unwrap_or_else(|| format!("#{id}")))
-    };
     Ok(Some(PackageInstallHooks {
-        version: version_name(latest.version_id)?,
+        version: version_name(db, latest.version_id)?,
         analyzed_at: latest.analyzed_at,
-        baseline_version: baseline.map(|b| version_name(b.version_id)).transpose()?,
+        baseline_version: baseline.map(|b| version_name(db, b.version_id)).transpose()?,
         hooks,
     }))
 }
