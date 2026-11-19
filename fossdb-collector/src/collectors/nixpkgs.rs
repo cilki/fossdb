@@ -220,7 +220,7 @@ impl Collector for NixpkgsCollector {
                 Ok(existing) => existing,
                 Err(e) if aborts_run(&e) => return Err(e),
                 Err(e) => {
-                    tracing::warn!("Lookup failed for {}: {}", package_name, e);
+                    tracing::warn!("Lookup failed for {}: {:#}", package_name, e);
                     continue;
                 }
             };
@@ -228,7 +228,7 @@ impl Collector for NixpkgsCollector {
             let package_meta = match self.get_package_details(&attr_path).await {
                 Ok(meta) => Some(meta),
                 Err(e) => {
-                    tracing::warn!("Failed to fetch details for {}: {}", package_name, e);
+                    tracing::warn!("Failed to fetch details for {}: {:#}", package_name, e);
                     None
                 }
             };
@@ -293,7 +293,7 @@ impl Collector for NixpkgsCollector {
                     ),
                     Err(e) if aborts_run(&e) => return Err(e),
                     Err(e) => {
-                        tracing::error!("Failed to submit version for {}: {}", package_name, e)
+                        tracing::error!("Failed to submit version for {}: {:#}", package_name, e)
                     }
                 }
 
@@ -363,7 +363,7 @@ impl Collector for NixpkgsCollector {
             match client.submit_package(pkg).await {
                 Ok(_) => tracing::info!("Submitted package: {}", package_name),
                 Err(e) if aborts_run(&e) => return Err(e),
-                Err(e) => tracing::error!("Failed to submit {}: {}", package_name, e),
+                Err(e) => tracing::error!("Failed to submit {}: {:#}", package_name, e),
             }
 
             packages_processed += 1;

@@ -49,7 +49,7 @@ async fn main() -> Result<()> {
     loop {
         match run_once(&client).await {
             Ok(()) => {}
-            Err(e) => tracing::error!("Worker iteration failed: {}", e),
+            Err(e) => tracing::error!("Worker iteration failed: {:#}", e),
         }
 
         tracing::debug!("Sleeping {} seconds before next task", config.interval_secs);

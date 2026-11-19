@@ -66,8 +66,12 @@ impl std::fmt::Display for ServerUnusable {
 }
 
 impl std::error::Error for ServerUnusable {
+    /// The reqwest error's *cause*, not the reqwest error itself: `Display`
+    /// already quotes the latter, and logging with `{:#}` would print it
+    /// twice. Its cause is where "connection refused", a DNS failure or a TLS
+    /// error is spelled out.
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        Some(&self.0)
+        std::error::Error::source(&self.0)
     }
 }
 
@@ -363,6 +367,17 @@ mod tests {
         let err = client.get_package("serde").await.unwrap_err();
         assert!(aborts_run(&err), "{err}");
         assert!(err.to_string().contains("SERVER_INTERNAL_URL"), "{err}");
+
+        // The log line (`{:#}`) must reach the transport-level cause, which
+        // is what tells a refused connection from a DNS or TLS failure, and
+        // must not repeat reqwest's own message on the way there.
+        let logged = format!("{err:#}");
+        assert!(err.chain().count() > 2, "{logged}");
+        assert_eq!(
+            logged.matches("error sending request").count(),
+            1,
+            "{logged}"
+        );
     }
 
     #[tokio::test]

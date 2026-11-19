@@ -225,7 +225,7 @@ impl Collector for CratesIoCollector {
                     if aborts_run(&e) {
                         return Err(e);
                     }
-                    tracing::warn!("Failed to process crate {}: {}", krate.name, e);
+                    tracing::warn!("Failed to process crate {}: {:#}", krate.name, e);
                 }
 
                 packages_processed += 1;

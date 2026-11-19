@@ -363,7 +363,7 @@ impl Collector for LibrariesIoCollector {
                         match client.submit_package(pkg).await {
                             Ok(_) => {}
                             Err(e) if aborts_run(&e) => return Err(e),
-                            Err(e) => tracing::error!("Failed to submit package: {}", e),
+                            Err(e) => tracing::error!("Failed to submit package: {:#}", e),
                         }
 
                         packages_processed += 1;
@@ -375,7 +375,7 @@ impl Collector for LibrariesIoCollector {
                         }
                     }
                 }
-                Err(e) => tracing::warn!("Failed to scrape platform {}: {}", platform.name, e),
+                Err(e) => tracing::warn!("Failed to scrape platform {}: {:#}", platform.name, e),
             }
         }
 

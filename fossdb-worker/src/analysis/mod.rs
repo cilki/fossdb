@@ -84,12 +84,12 @@ pub async fn analyze(task: &WorkerTask, http: &reqwest::Client) -> Result<Worker
                     findings.append(&mut analysis.findings);
                     detected_licenses = analysis.detected_licenses;
                 }
-                Err(e) => tracing::warn!("Source analysis failed: {}", e),
+                Err(e) => tracing::warn!("Source analysis failed: {:#}", e),
             }
         }
         None => match binary::analyze(tmp.path(), &task.package.name) {
             Ok(mut binary_findings) => findings.append(&mut binary_findings),
-            Err(e) => tracing::warn!("Binary analysis failed: {}", e),
+            Err(e) => tracing::warn!("Binary analysis failed: {:#}", e),
         },
     }
 

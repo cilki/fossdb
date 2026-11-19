@@ -130,7 +130,7 @@ async fn run_collector_loop(
         tracing::info!("Starting collector: {}", name);
         match collector.collect(client.clone()).await {
             Ok(()) => tracing::info!("Collector {} completed", name),
-            Err(e) => tracing::error!("Collector {} failed: {}", name, e),
+            Err(e) => tracing::error!("Collector {} failed: {:#}", name, e),
         }
         // `saturating_mul` so a large COLLECTOR_INTERVAL_HOURS cannot overflow
         // (a panic with overflow checks on, or a near-zero sleep without them).

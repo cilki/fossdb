@@ -146,7 +146,7 @@ impl Collector for OsvCollector {
                     }
                     Err(e) if aborts_run(&e) => return Err(e),
                     Err(e) => {
-                        tracing::warn!("Failed to look up package {}: {}", name, e);
+                        tracing::warn!("Failed to look up package {}: {:#}", name, e);
                         lookup_failed = true;
                         break;
                     }
@@ -181,7 +181,7 @@ impl Collector for OsvCollector {
                 Err(e) if aborts_run(&e) => return Err(e),
                 Err(e) => {
                     failed += 1;
-                    tracing::warn!("Failed to submit advisory {}: {}", id, e);
+                    tracing::warn!("Failed to submit advisory {}: {:#}", id, e);
                 }
             }
         }
