@@ -4,11 +4,10 @@ use axum::{
     response::Json,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 // `SubscriptionRequest`/`SubscriptionResponse` come from the shared `fossdb`
 // crate so the client cannot drift out of sync with the wire format.
-use fossdb::SubscribeResponse;
+use fossdb::{SubscribeResponse, TimelineResponse};
 
 use crate::db::Database;
 use crate::lookalike::LookalikeTargets;
@@ -52,83 +51,34 @@ fn load_user(state: &AppState, authed: &AuthedUser) -> Result<crate::models::Use
         .ok_or(StatusCode::NOT_FOUND)
 }
 
+/// The account's personal, persisted timeline, newest first and paginated.
 pub async fn get_timeline(
     State(state): State<AppState>,
     Query(params): Query<TimelineQuery>,
-    authed: Option<Extension<AuthedUser>>,
-) -> Result<Json<Value>, StatusCode> {
-    // Signed in: the account's personal, persisted timeline, paginated.
-    // Anonymous: a global timeline synthesised from recent package versions.
-    let is_authenticated = authed.is_some();
+    Extension(authed): Extension<AuthedUser>,
+) -> Result<Json<TimelineResponse>, StatusCode> {
+    let mut events = state
+        .db
+        .get_timeline_events_by_user(&authed.user_id)
+        .map_err(|e| {
+            tracing::error!("timeline lookup failed: {e}");
+            StatusCode::INTERNAL_SERVER_ERROR
+        })?;
 
-    let mut db_events = if let Some(Extension(authed)) = authed {
-        let mut events = state
-            .db
-            .get_timeline_events_by_user(&authed.user_id)
-            .map_err(|e| {
-                tracing::error!("timeline lookup failed: {e}");
-                StatusCode::INTERNAL_SERVER_ERROR
-            })?;
+    // The secondary-key scan returns insertion order, which is only
+    // incidentally chronological.
+    events.sort_by(|a, b| b.created_at.cmp(&a.created_at));
 
-        // Newest first. The secondary-key scan returns insertion order, which
-        // is only incidentally chronological.
-        events.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-        events
-    } else {
-        use crate::{EventType, TimelineEvent};
+    let total = events.len();
+    let limit = params.limit.unwrap_or(20).min(100);
+    let offset = params.offset.unwrap_or(0);
 
-        let mut versions = state
-            .db
-            .get_all_versions()
-            .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-        versions.sort_by(|a, b| b.release_date.cmp(&a.release_date));
-
-        versions
-            .into_iter()
-            .take(50)
-            .filter_map(|version| {
-                state
-                    .db
-                    .get_package(version.package_id)
-                    .ok()?
-                    .map(|package| {
-                        let version_str = version.version.clone();
-                        TimelineEvent {
-                            inner: fossdb::TimelineEvent {
-                                id: 0,
-                                package_id: package.id,
-                                user_id: None,
-                                event_type: EventType::NewRelease,
-                                package_name: package.name.clone(),
-                                version: Some(version.version.clone()),
-                                message: format!("New version {version_str} released"),
-                                metadata: None,
-                                created_at: version.release_date,
-                            },
-                        }
-                    })
-            })
-            .collect()
-    };
-
-    let total = db_events.len();
-
-    if is_authenticated {
-        let limit = params.limit.unwrap_or(20).min(100);
-        let offset = params.offset.unwrap_or(0);
-
-        db_events = db_events.into_iter().skip(offset).take(limit).collect();
-
-        Ok(Json(serde_json::json!({
-            "events": db_events,
-            "total": total,
-            "limit": limit,
-            "offset": offset
-        })))
-    } else {
-        Ok(Json(serde_json::json!({ "events": db_events })))
-    }
+    Ok(Json(TimelineResponse {
+        events: events.into_iter().skip(offset).take(limit).map(|e| e.inner).collect(),
+        total,
+        limit,
+        offset,
+    }))
 }
 
 pub async fn get_subscriptions(

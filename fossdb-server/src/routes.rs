@@ -31,17 +31,10 @@ pub fn public_router(state: AppState) -> Router {
         )
         .route("/api/users/settings/notifications", get(handlers::users::get_notification_settings))
         .route("/api/users/settings/notifications", put(handlers::users::update_notification_settings))
-        .route_layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            middleware::auth_middleware,
-        ))
-        .with_state(state.clone());
-
-    let timeline_route = Router::new()
         .route("/api/users/timeline", get(handlers::users::get_timeline))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
-            middleware::optional_auth_middleware,
+            middleware::auth_middleware,
         ))
         .with_state(state.clone());
 
@@ -65,7 +58,6 @@ pub fn public_router(state: AppState) -> Router {
         // these must stay off the bearer-auth router.
         .route("/feed/{user_id}/atom.xml", get(handlers::feed::atom))
         .route("/feed/{user_id}/rss.xml", get(handlers::feed::rss))
-        .merge(timeline_route)
         .merge(protected)
         .layer(CorsLayer::permissive())
         .with_state(state)
@@ -137,6 +129,10 @@ mod tests {
         );
         assert_eq!(
             status(Method::DELETE, "/api/users/subscriptions/serde", None).await,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            status(Method::GET, "/api/users/timeline", None).await,
             StatusCode::UNAUTHORIZED
         );
         assert_eq!(

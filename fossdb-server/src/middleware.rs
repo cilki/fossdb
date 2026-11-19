@@ -66,27 +66,6 @@ pub async fn auth_middleware(
     Ok(next.run(req).await)
 }
 
-/// Auth for endpoints that serve both anonymous and signed-in callers.
-///
-/// A *missing* credential is fine and proceeds anonymously. A *present but
-/// invalid* one is rejected: previously it was silently ignored, so a caller
-/// whose account had been purged kept getting anonymous responses with no
-/// indication that their credential had stopped working.
-pub async fn optional_auth_middleware(
-    State(state): State<AppState>,
-    mut req: Request,
-    next: Next,
-) -> Result<Response, StatusCode> {
-    if let Some(candidate) = bearer(&req).map(str::to_string) {
-        let authed = resolve(&state, &candidate)
-            .await
-            .ok_or(StatusCode::UNAUTHORIZED)?;
-        req.extensions_mut().insert(authed);
-    }
-
-    Ok(next.run(req).await)
-}
-
 /// Authenticate a collector or worker API key for `required_role`.
 ///
 /// Keys live in the database and are minted and revoked through the admin
