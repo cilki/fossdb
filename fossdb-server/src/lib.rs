@@ -1,5 +1,5 @@
 pub use fossdb::{
-    AffectedPackage, AnalysisFinding, AuthResponse, CreatePackageRequest, DatabaseStats,
+    AffectedPackage, AnalysisFinding, AuthResponse, DatabaseStats,
     Dependency, EventType, FindingKind, FindingSeverity, LoginRequest, PackageSubscription,
     PackagesResponse, RegisterResponse, SubscriptionRequest, SubscriptionResponse,
     TimelineEventType, TimelineResponse, UserResponse, VulnerabilitySeverity, WebSocketMessage,

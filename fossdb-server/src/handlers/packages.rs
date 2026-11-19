@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use crate::db::Database;
 use crate::db_listener::install_hook_changes;
 use crate::lookalike::LookalikeTargets;
-use crate::{AppState, Package, PackageVersion, CreatePackageRequest};
+use crate::{AppState, Package, PackageVersion};
 
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
@@ -133,37 +133,6 @@ pub async fn get_package(
     match state.db.get_package(id) {
         Ok(Some(package)) => Ok(Json(package)),
         Ok(None) => Err(StatusCode::NOT_FOUND),
-        Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
-    }
-}
-
-pub async fn create_package(
-    State(state): State<AppState>,
-    Json(payload): Json<CreatePackageRequest>,
-) -> Result<Json<Package>, StatusCode> {
-    let now = Utc::now();
-
-    let package = Package {
-        inner: fossdb::Package {
-            id: 0, // Will be auto-generated
-            name: payload.name,
-            description: payload.description,
-            homepage: payload.homepage,
-            repository: payload.repository,
-            license: payload.license,
-            tags: payload.tags,
-            created_at: now,
-            updated_at: now,
-            platform: None,
-            language: None,
-            status: None,
-            dependents_count: None,
-            rank: None,
-        },
-    };
-
-    match state.db.insert_package(package) {
-        Ok(package) => Ok(Json(package)),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }

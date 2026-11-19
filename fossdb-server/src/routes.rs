@@ -17,8 +17,11 @@ use crate::{AppState, handlers, middleware, websocket};
 /// 401 instead of 404, telling a caller with a typo or an outdated client that
 /// their credential was the problem.
 pub fn public_router(state: AppState) -> Router {
+    // Packages are written only by collectors, over the internal collector
+    // API. Accounts are anonymous and free to create, so a public write route
+    // would let anyone claim a name ahead of its collector, and the collector
+    // then keeps that row's homepage and repository as the package's own.
     let protected = Router::new()
-        .route("/api/packages", post(handlers::packages::create_package))
         .route("/api/users/subscriptions", get(handlers::users::get_subscriptions))
         .route("/api/users/subscriptions", post(handlers::users::add_subscription))
         .route(
@@ -140,5 +143,43 @@ mod tests {
             StatusCode::UNAUTHORIZED
         );
         assert_eq!(status(Method::GET, "/api/health", None).await, StatusCode::OK);
+    }
+
+    /// Anyone can mint an account, so a signed-in account must not be able to
+    /// write to the package catalogue: a name claimed here would keep its
+    /// claimant's homepage and repository once the real package is collected.
+    #[tokio::test]
+    async fn accounts_cannot_create_packages() {
+        let (_dir, state) = state();
+        let user_id = "fdb_0123456789abcdefghjkmnpqrs";
+        state
+            .db
+            .insert_user(crate::User {
+                inner: fossdb::User {
+                    user_id: user_id.into(),
+                    subscriptions: Vec::new(),
+                    created_at: chrono::Utc::now(),
+                    notifications_enabled: true,
+                },
+            })
+            .unwrap()
+            .unwrap();
+        let db = state.db.clone();
+
+        let response = public_router(state)
+            .oneshot(
+                Request::builder()
+                    .method(Method::POST)
+                    .uri("/api/packages")
+                    .header(header::AUTHORIZATION, format!("Bearer {user_id}"))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"name":"rand","tags":[]}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::METHOD_NOT_ALLOWED);
+        assert!(db.get_package_by_name("rand").unwrap().is_none());
     }
 }
