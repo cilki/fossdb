@@ -346,9 +346,12 @@ async fn import_database(config: &Config, input: PathBuf, merge: bool) -> Result
 
     let json = std::fs::read_to_string(&input)?;
 
-    macro_rules! import_with_progress {
-        ($data:expr, $type_name:expr, $get_method:ident, $insert_method:ident) => {{
-            eprintln!("Found {} {} to import", $data.len(), $type_name);
+    // Rows keep the primary keys they were exported with. Existing rows with
+    // the same key are skipped under `--merge` and overwritten otherwise.
+    macro_rules! import_rows {
+        ($data:expr, $type_name:expr, $key:expr) => {{
+            let data = $data;
+            eprintln!("Found {} {} to import", data.len(), $type_name);
 
             if !merge {
                 eprintln!("WARNING: This will replace existing {}!", $type_name);
@@ -356,63 +359,31 @@ async fn import_database(config: &Config, input: PathBuf, merge: bool) -> Result
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
             }
 
-            let total = $data.len();
-            for (idx, item) in $data.into_iter().enumerate() {
-                if merge && db.$get_method(item.id)?.is_some() {
-                    continue;
-                }
-                db.$insert_method(item)?;
-
-                if (idx + 1) % 100 == 0 || idx + 1 == total {
-                    eprint!("\rImporting {}: {}/{}", $type_name, idx + 1, total);
-                    use std::io::Write;
-                    std::io::stderr().flush()?;
-                }
-            }
-            eprintln!("\n✓ Imported {} {}", total, $type_name);
+            let counts = db.import(data, $key, merge)?;
+            eprintln!(
+                "✓ Imported {} {} ({} new, {} replaced, {} skipped as already present)",
+                counts.inserted + counts.replaced,
+                $type_name,
+                counts.inserted,
+                counts.replaced,
+                counts.skipped
+            );
         }};
     }
 
     match table_name {
         "packages" => {
             let data: Vec<Package> = serde_json::from_str(&json)?;
-            import_with_progress!(data, "packages", get_package, insert_package);
+            import_rows!(data, "packages", |p: &Package| p.id);
         }
         "versions" => {
             let data: Vec<PackageVersion> = serde_json::from_str(&json)?;
-            import_with_progress!(data, "versions", get_version, insert_version);
+            import_rows!(data, "versions", |v: &PackageVersion| v.id);
         }
-        // Users are keyed by their credential rather than a numeric id, and
-        // `insert_user` reports a key collision as `Ok(None)` instead of
-        // erroring, so this cannot use the macro above.
+        // Users are keyed by their credential rather than a numeric id.
         "users" => {
             let data: Vec<User> = serde_json::from_str(&json)?;
-            eprintln!("Found {} users to import", data.len());
-
-            if !merge {
-                eprintln!("WARNING: This will replace existing users!");
-                eprintln!("Press Ctrl+C within 5 seconds to cancel...");
-                tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            }
-
-            let total = data.len();
-            let mut skipped = 0;
-            for (idx, item) in data.into_iter().enumerate() {
-                if merge && db.get_user(&item.user_id)?.is_some() {
-                    skipped += 1;
-                    continue;
-                }
-                if db.insert_user(item)?.is_none() {
-                    skipped += 1;
-                }
-
-                if (idx + 1) % 100 == 0 || idx + 1 == total {
-                    eprint!("\rImporting users: {}/{}", idx + 1, total);
-                    use std::io::Write;
-                    std::io::stderr().flush()?;
-                }
-            }
-            eprintln!("\n✓ Imported {} users ({} skipped)", total - skipped, skipped);
+            import_rows!(data, "users", |u: &User| u.user_id.clone());
         }
         "vulnerabilities" => {
             let mut data: Vec<Vulnerability> = serde_json::from_str(&json)?;
@@ -422,11 +393,11 @@ async fn import_database(config: &Config, input: PathBuf, merge: bool) -> Result
                     v.inner.source_id = fossdb_server::models::legacy_source_id(v.id);
                 }
             }
-            import_with_progress!(data, "vulnerabilities", get_vulnerability, insert_vulnerability);
+            import_rows!(data, "vulnerabilities", |v: &Vulnerability| v.id);
         }
         "timeline_events" => {
             let data: Vec<TimelineEvent> = serde_json::from_str(&json)?;
-            import_with_progress!(data, "timeline events", get_timeline_event, insert_timeline_event);
+            import_rows!(data, "timeline events", |e: &TimelineEvent| e.id);
         }
         _ => {
             eprintln!("Error: Unknown table '{}'", table_name);
