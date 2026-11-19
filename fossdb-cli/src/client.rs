@@ -3,6 +3,7 @@
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use fossdb::url::percent_encode;
 use fossdb::{
     AuthResponse, PackageSubscription, RegisterResponse, SubscribeResponse, SubscriptionRequest,
     SubscriptionResponse,
@@ -158,7 +159,7 @@ impl Client {
         // Percent-encode the path segment: package names legitimately contain
         // `/` (scoped npm packages such as `@angular/cli`), which would
         // otherwise be read as a path separator and hit a different route.
-        let encoded = encode_path_segment(package_name);
+        let encoded = percent_encode(package_name);
 
         let response = self
             .authed(
@@ -184,7 +185,7 @@ impl Client {
         package_name: &str,
         enabled: bool,
     ) -> Result<Vec<PackageSubscription>> {
-        let encoded = encode_path_segment(package_name);
+        let encoded = percent_encode(package_name);
 
         let response = self
             .authed(self.http.put(self.url(&format!(
@@ -214,25 +215,6 @@ pub fn not_subscribed(package_name: &str) -> String {
     )
 }
 
-/// Percent-encode one URL path segment.
-///
-/// Encodes everything outside the RFC 3986 unreserved set, operating on UTF-8
-/// bytes so that non-ASCII names encode correctly.
-pub fn encode_path_segment(segment: &str) -> String {
-    let mut out = String::with_capacity(segment.len());
-
-    for byte in segment.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*byte as char)
-            }
-            other => out.push_str(&format!("%{other:02X}")),
-        }
-    }
-
-    out
-}
-
 /// Read a response body as text, tolerating a failed read.
 trait ResponseTextExt {
     async fn unwrap_or_default_text(self) -> String;
@@ -249,33 +231,5 @@ impl ResponseTextExt for reqwest::Response {
             // returns an HTML error page.
             .take(500)
             .collect()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn leaves_unreserved_characters_alone() {
-        assert_eq!(encode_path_segment("serde_json-1.0~x"), "serde_json-1.0~x");
-    }
-
-    #[test]
-    fn encodes_scoped_package_names() {
-        // The case that makes this necessary rather than cosmetic.
-        assert_eq!(encode_path_segment("@angular/cli"), "%40angular%2Fcli");
-    }
-
-    #[test]
-    fn encodes_traversal_and_query_characters() {
-        assert_eq!(encode_path_segment("../../etc"), "..%2F..%2Fetc");
-        assert_eq!(encode_path_segment("a?b#c"), "a%3Fb%23c");
-    }
-
-    #[test]
-    fn encodes_utf8_as_bytes() {
-        // Two bytes, so two escapes - not one per scalar value.
-        assert_eq!(encode_path_segment("é"), "%C3%A9");
     }
 }

@@ -1,5 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use fossdb::url::percent_encode;
 use fossdb::{CollectedPackage, Package, PackageLookup};
 use reqwest::Client;
 use serde::Serialize;
@@ -18,25 +19,6 @@ use std::time::Instant;
 const SERVER_TIMEOUT: Duration = Duration::from_secs(30);
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// Percent-encode a string for use in a URL path segment or query value.
-///
-/// Encoding operates on UTF-8 bytes. The previous implementation formatted the
-/// Unicode scalar value (`c as u32`), so `é` (U+00E9) became `%E9` - a lone
-/// invalid UTF-8 byte the server rejects - and `中` (U+4E2D) became `%4E2D`,
-/// i.e. the literal text `N2D`, silently querying the wrong package.
-pub(crate) fn percent_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{:02X}", byte)),
-        }
-    }
-    out
-}
 
 /// fossdb-server could not be reached, or it rejected the collector's API key.
 ///
@@ -385,27 +367,6 @@ mod tests {
         let client = client_answered_with("500 Internal Server Error").await;
         let err = client.get_package("serde").await.unwrap_err();
         assert!(!aborts_run(&err), "{err}");
-    }
-
-    #[test]
-    fn percent_encodes_utf8_bytes() {
-        // Multi-byte characters must be encoded per UTF-8 byte.
-        assert_eq!(percent_encode("é"), "%C3%A9");
-        assert_eq!(percent_encode("中"), "%E4%B8%AD");
-    }
-
-    #[test]
-    fn percent_encoding_preserves_unreserved_characters() {
-        assert_eq!(percent_encode("serde_json-1.0.x~test"), "serde_json-1.0.x~test");
-    }
-
-    #[test]
-    fn percent_encodes_url_structural_characters() {
-        assert_eq!(percent_encode("@babel/core"), "%40babel%2Fcore");
-        assert_eq!(percent_encode("a b"), "a%20b");
-        assert_eq!(percent_encode("x&limit=1"), "x%26limit%3D1");
-        assert_eq!(percent_encode("c++"), "c%2B%2B");
-        assert_eq!(percent_encode("a#b?c"), "a%23b%3Fc");
     }
 
     #[cfg(feature = "collector-libraries-io")]

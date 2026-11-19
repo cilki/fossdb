@@ -1,4 +1,5 @@
-use crate::api::{client::encode_uri_component, types::*, ApiClient};
+use crate::api::{types::*, ApiClient};
+use fossdb::url::percent_encode;
 use fossdb::typosquat::PackageLookalike;
 use crate::hooks::{use_auth, use_notifications};
 use dioxus::prelude::*;
@@ -65,7 +66,7 @@ fn advisory_url(source_id: &str) -> Option<String> {
     }
     Some(format!(
         "https://osv.dev/vulnerability/{}",
-        encode_uri_component(source_id)
+        percent_encode(source_id)
     ))
 }
 

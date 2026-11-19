@@ -4,6 +4,7 @@ use serde::{Deserialize, Serialize};
 pub mod api_key;
 pub mod secret_file;
 pub mod typosquat;
+pub mod url;
 pub mod user_id;
 
 pub use api_key::ApiKeyRole;

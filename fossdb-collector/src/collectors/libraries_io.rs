@@ -1,14 +1,13 @@
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use fossdb::url::percent_encode;
 use fossdb::{CollectedPackage, CollectedVersion, Dependency};
 use reqwest::{Client, Response};
 use serde::{Deserialize, Deserializer, de::DeserializeOwned};
 use std::sync::Arc;
 
-use crate::client::{
-    AdaptiveConfig, AdaptiveRateLimitedClient, CollectorClient, aborts_run, percent_encode,
-};
+use crate::client::{AdaptiveConfig, AdaptiveRateLimitedClient, CollectorClient, aborts_run};
 use crate::collectors::{Collector, helpers};
 
 /// Results requested per search page.

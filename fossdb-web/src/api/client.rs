@@ -1,4 +1,5 @@
 use super::types::*;
+use fossdb::url::percent_encode;
 use gloo_console::log;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
@@ -8,24 +9,6 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::{Request, RequestInit, RequestMode, Response};
 
 type Result<T> = std::result::Result<T, JsValue>;
-
-/// Percent-encode a value for use in a URL path segment or query value.
-///
-/// Raw interpolation let user input change the request: searching for `c++`
-/// arrived as two spaces, a `#` truncated the query client-side, and `&`
-/// allowed injecting additional parameters such as `limit`.
-pub(crate) fn encode_uri_component(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.as_bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(*byte as char)
-            }
-            _ => out.push_str(&format!("%{:02X}", byte)),
-        }
-    }
-    out
-}
 
 /// Server-side filters for `GET /packages`.
 #[derive(Default, Clone, Copy)]
@@ -165,7 +148,7 @@ impl ApiClient {
             ("updated_within", filters.updated_within),
         ] {
             if let Some(value) = value.filter(|v| !v.is_empty()) {
-                path.push_str(&format!("&{}={}", key, encode_uri_component(value)));
+                path.push_str(&format!("&{}={}", key, percent_encode(value)));
             }
         }
         self.request("GET", &path, None).await
@@ -174,7 +157,7 @@ impl ApiClient {
     pub async fn get_package(&self, id: &str) -> Result<Package> {
         self.request(
             "GET",
-            &format!("/packages/{}", encode_uri_component(id)),
+            &format!("/packages/{}", percent_encode(id)),
             None,
         )
         .await
@@ -183,7 +166,7 @@ impl ApiClient {
     pub async fn get_package_versions(&self, id: &str) -> Result<Vec<PackageVersion>> {
         self.request(
             "GET",
-            &format!("/packages/{}/versions", encode_uri_component(id)),
+            &format!("/packages/{}/versions", percent_encode(id)),
             None,
         )
         .await
@@ -194,7 +177,7 @@ impl ApiClient {
     pub async fn get_package_vulnerabilities(&self, id: &str) -> Result<Vec<PackageVulnerability>> {
         self.request(
             "GET",
-            &format!("/packages/{}/vulnerabilities", encode_uri_component(id)),
+            &format!("/packages/{}/vulnerabilities", percent_encode(id)),
             None,
         )
         .await
@@ -205,7 +188,7 @@ impl ApiClient {
     pub async fn get_package_install_hooks(&self, id: &str) -> Result<Option<PackageInstallHooks>> {
         self.request(
             "GET",
-            &format!("/packages/{}/install-hooks", encode_uri_component(id)),
+            &format!("/packages/{}/install-hooks", percent_encode(id)),
             None,
         )
         .await
@@ -216,7 +199,7 @@ impl ApiClient {
     pub async fn get_package_lookalike(&self, id: &str) -> Result<Option<typosquat::PackageLookalike>> {
         self.request(
             "GET",
-            &format!("/packages/{}/lookalike", encode_uri_component(id)),
+            &format!("/packages/{}/lookalike", percent_encode(id)),
             None,
         )
         .await
@@ -233,7 +216,7 @@ impl ApiClient {
         let result: SubscriberCount = self
             .request(
                 "GET",
-                &format!("/packages/{}/subscribers", encode_uri_component(id)),
+                &format!("/packages/{}/subscribers", percent_encode(id)),
                 None,
             )
             .await?;
@@ -270,7 +253,7 @@ impl ApiClient {
                 "DELETE",
                 &format!(
                     "/users/subscriptions/{}",
-                    encode_uri_component(package_name)
+                    percent_encode(package_name)
                 ),
                 None,
             )
@@ -296,7 +279,7 @@ impl ApiClient {
                 "PUT",
                 &format!(
                     "/users/subscriptions/{}/notifications",
-                    encode_uri_component(package_name)
+                    percent_encode(package_name)
                 ),
                 Some(body),
             )
