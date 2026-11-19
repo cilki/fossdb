@@ -479,6 +479,41 @@ impl Database {
         Ok(delete_count)
     }
 
+    /// Write exported rows back under their own primary keys.
+    ///
+    /// A row whose key is already taken is skipped when `merge` is set and
+    /// overwritten otherwise. Everything happens in one transaction, so an
+    /// import that fails part-way - say on a package whose name is already
+    /// used by one with a different id - leaves the database untouched
+    /// instead of half-imported.
+    pub fn import<T: ToInput, K: ToKey>(
+        &self,
+        rows: Vec<T>,
+        key: impl Fn(&T) -> K,
+        merge: bool,
+    ) -> Result<ImportCounts> {
+        let rw = self.db.rw_transaction()?;
+        let mut counts = ImportCounts::default();
+
+        for row in rows {
+            if merge {
+                if rw.get().primary::<T>(key(&row))?.is_some() {
+                    counts.skipped += 1;
+                    continue;
+                }
+                rw.insert(row)?;
+                counts.inserted += 1;
+            } else if rw.upsert(row)?.is_some() {
+                counts.replaced += 1;
+            } else {
+                counts.inserted += 1;
+            }
+        }
+
+        rw.commit()?;
+        Ok(counts)
+    }
+
     pub fn get_vulnerability_by_source_id(&self, source_id: &str) -> Result<Option<Vulnerability>> {
         let r = self.db.r_transaction()?;
         Ok(r.get().secondary(VulnerabilityKey::source_id, source_id)?)
@@ -618,6 +653,107 @@ mod tests {
         assert!(outcome.created);
         assert_eq!(outcome.vulnerability.id, 8);
     }
+
+    fn package(id: u64, name: &str, description: &str) -> Package {
+        let now = chrono::Utc::now();
+        Package {
+            inner: fossdb::Package {
+                id,
+                name: name.into(),
+                description: Some(description.into()),
+                homepage: None,
+                repository: None,
+                license: None,
+                tags: Vec::new(),
+                created_at: now,
+                updated_at: now,
+                platform: None,
+                language: None,
+                status: None,
+                dependents_count: None,
+                rank: None,
+            },
+        }
+    }
+
+    fn open() -> (tempfile::TempDir, Database) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Database::new(dir.path().join("db").to_str().unwrap()).unwrap();
+        (dir, db)
+    }
+
+    fn description(db: &Database, id: u64) -> String {
+        db.get_package(id).unwrap().unwrap().description.clone().unwrap()
+    }
+
+    #[test]
+    fn import_without_merge_replaces_rows_with_the_same_id() {
+        let (_dir, db) = open();
+        db.insert_package(package(1, "serde", "old")).unwrap();
+
+        let counts = db
+            .import(
+                vec![package(1, "serde", "new"), package(2, "tokio", "new")],
+                |p: &Package| p.id,
+                false,
+            )
+            .unwrap();
+
+        assert_eq!(counts, ImportCounts { inserted: 1, replaced: 1, skipped: 0 });
+        assert_eq!(description(&db, 1), "new");
+        assert_eq!(description(&db, 2), "new");
+        // The name index follows the replaced row rather than keeping a
+        // stale entry that would block the name.
+        assert_eq!(db.get_package_by_name("serde").unwrap().unwrap().id, 1);
+    }
+
+    #[test]
+    fn import_with_merge_keeps_existing_rows_and_counts_them_as_skipped() {
+        let (_dir, db) = open();
+        db.insert_package(package(1, "serde", "old")).unwrap();
+
+        let counts = db
+            .import(
+                vec![package(1, "serde", "new"), package(2, "tokio", "new")],
+                |p: &Package| p.id,
+                true,
+            )
+            .unwrap();
+
+        assert_eq!(counts, ImportCounts { inserted: 1, replaced: 0, skipped: 1 });
+        assert_eq!(description(&db, 1), "old");
+        assert_eq!(description(&db, 2), "new");
+    }
+
+    #[test]
+    fn failed_import_leaves_the_database_untouched() {
+        let (_dir, db) = open();
+        db.insert_package(package(1, "serde", "old")).unwrap();
+
+        // Row 3 reuses the unique name of package 1 under another id, so the
+        // import fails after rows 2 and 1 have already been written.
+        let result = db.import(
+            vec![
+                package(2, "tokio", "new"),
+                package(1, "serde", "new"),
+                package(3, "serde", "clash"),
+            ],
+            |p: &Package| p.id,
+            false,
+        );
+
+        assert!(result.is_err());
+        assert!(db.get_package(2).unwrap().is_none());
+        assert_eq!(description(&db, 1), "old");
+    }
+}
+
+/// Outcome of [`Database::import`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct ImportCounts {
+    pub inserted: usize,
+    pub replaced: usize,
+    pub skipped: usize,
 }
 
 /// Outcome of [`Database::upsert_advisory`].
