@@ -1,17 +1,14 @@
 use anyhow::Result;
 use axum::{
     Router,
-    response::Json,
     routing::{get, post, put},
 };
 use clap::Parser;
 use serde::Serialize;
-use serde_json::{Value, json};
 use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
-use tower_http::cors::CorsLayer;
 use tracing::{error, info};
 
 use fossdb_server::{AppState, config::Config, db::Database, handlers, middleware};
@@ -174,7 +171,7 @@ async fn start_server(config: Config) -> Result<()> {
         .route("/packages/next", get(handlers::worker::get_task))
         .route("/analysis", post(handlers::worker::submit_analysis))
         .route("/packages/{package_id}/analyses", get(handlers::worker::get_package_analyses))
-        .layer(axum::middleware::from_fn_with_state(
+        .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::worker_auth_middleware,
         ))
@@ -195,7 +192,7 @@ async fn start_server(config: Config) -> Result<()> {
         .route("/packages", post(handlers::collector::upsert_package))
         .route("/packages/{name}/timestamp", put(handlers::collector::update_package_timestamp))
         .route("/advisories", post(handlers::collector::upsert_advisory))
-        .layer(axum::middleware::from_fn_with_state(
+        .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             middleware::collector_auth_middleware,
         ))
@@ -210,59 +207,7 @@ async fn start_server(config: Config) -> Result<()> {
         }
     });
 
-    // Public API
-    let protected = Router::new()
-        .route("/api/packages", post(handlers::packages::create_package))
-        .route("/api/users/subscriptions", get(handlers::users::get_subscriptions))
-        .route("/api/users/subscriptions", post(handlers::users::add_subscription))
-        .route(
-            "/api/users/subscriptions/{package_name}",
-            axum::routing::delete(handlers::users::remove_subscription),
-        )
-        .route(
-            "/api/users/subscriptions/{package_name}/notifications",
-            put(handlers::users::update_package_notification),
-        )
-        .route("/api/users/settings/notifications", get(handlers::users::get_notification_settings))
-        .route("/api/users/settings/notifications", put(handlers::users::update_notification_settings))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            middleware::auth_middleware,
-        ))
-        .with_state(state.clone());
-
-    let timeline_route = Router::new()
-        .route("/api/users/timeline", get(handlers::users::get_timeline))
-        .layer(axum::middleware::from_fn_with_state(
-            state.clone(),
-            middleware::optional_auth_middleware,
-        ))
-        .with_state(state.clone());
-
-    let app = Router::new()
-        .route("/api/health", get(health_check))
-        .route("/api/stats", get(handlers::analytics::get_db_stats))
-        .route("/api/packages", get(handlers::packages::list_packages))
-        .route("/api/packages/{id}", get(handlers::packages::get_package))
-        .route("/api/packages/{id}/versions", get(handlers::packages::get_package_versions))
-        .route("/api/packages/{id}/vulnerabilities", get(handlers::packages::get_package_vulnerabilities))
-        .route("/api/packages/{id}/install-hooks", get(handlers::packages::get_package_install_hooks))
-        .route("/api/packages/{id}/lookalike", get(handlers::packages::get_package_lookalike))
-        .route("/api/packages/{id}/subscribers", get(handlers::packages::get_package_subscriber_count))
-        .route("/api/auth/register", post(handlers::auth::register))
-        .route("/api/auth/login", post(handlers::auth::login))
-        .route("/api/analytics", get(handlers::analytics::get_analytics))
-        .route("/api/analytics/languages", get(handlers::analytics::get_language_trends))
-        .route("/api/analytics/security", get(handlers::analytics::get_security_report))
-        .route("/ws/timeline", get(websocket::timeline_websocket_handler))
-        // Feeds authenticate by path: the id in the URL is the credential, so
-        // these must stay off the bearer-auth router.
-        .route("/feed/{user_id}/atom.xml", get(handlers::feed::atom))
-        .route("/feed/{user_id}/rss.xml", get(handlers::feed::rss))
-        .merge(timeline_route)
-        .merge(protected)
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+    let app = fossdb_server::routes::public_router(state);
 
     let bind = format!("{}:{}", config.bind_address, config.server_port);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
@@ -270,13 +215,6 @@ async fn start_server(config: Config) -> Result<()> {
     info!("Public base URL for feed links: {}", config.public_base_url);
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-async fn health_check() -> Json<Value> {
-    Json(json!({
-        "status": "healthy",
-        "service": "fossdb"
-    }))
 }
 
 fn export_table<T: Serialize>(table_name: &str, data: Vec<T>, output_path: &Path) -> Result<()> {

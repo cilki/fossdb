@@ -38,6 +38,8 @@ pub mod middleware;
 #[cfg(feature = "api-server")]
 pub mod api_key;
 #[cfg(feature = "api-server")]
+pub mod routes;
+#[cfg(feature = "api-server")]
 pub mod user_id;
 #[cfg(feature = "api-server")]
 pub mod websocket;
