@@ -30,7 +30,6 @@ enum Commands {
     /// Start the API server (default)
     Serve,
     /// Export database tables to JSON files
-    #[cfg(feature = "db")]
     Export {
         #[arg(short, long, default_value = ".")]
         output_dir: PathBuf,
@@ -38,7 +37,6 @@ enum Commands {
         table: Option<String>,
     },
     /// Import database table from JSON file
-    #[cfg(feature = "db")]
     Import {
         #[arg(short, long)]
         input: PathBuf,
@@ -56,16 +54,13 @@ async fn main() -> Result<()> {
     let config = Config::from_env();
 
     match args.command {
-        #[cfg(feature = "db")]
         Some(Commands::Export { output_dir, table }) => {
             return export_database(&config, output_dir, table).await;
         }
-        #[cfg(feature = "db")]
         Some(Commands::Import { input, merge }) => {
             return import_database(&config, input, merge).await;
         }
-        Some(Commands::Serve) => start_server(config).await,
-        None => start_server(config).await,
+        Some(Commands::Serve) | None => start_server(config).await,
     }
 }
 

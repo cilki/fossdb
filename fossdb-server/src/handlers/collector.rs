@@ -304,7 +304,7 @@ pub async fn update_package_timestamp(
     match state.db.get_package_by_name(&name) {
         Ok(Some(mut pkg)) => {
             pkg.updated_at = body.updated_at;
-            match state.db.update_package(pkg) {
+            match state.db.update(pkg) {
                 Ok(_) => StatusCode::OK,
                 Err(e) => {
                     tracing::error!("Failed to update package timestamp: {}", e);
