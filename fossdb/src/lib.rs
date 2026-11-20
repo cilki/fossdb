@@ -86,6 +86,64 @@ impl std::fmt::Debug for CreateApiKeyResponse {
     }
 }
 
+/// `GET /admin/collectors`: collector key liveness plus per-platform evidence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectorsReport {
+    /// Collector keys and when each last authenticated.
+    pub keys: Vec<ApiKeyInfo>,
+    pub platforms: Vec<CollectorReport>,
+    /// When in-memory key activity tracking started, i.e. server start.
+    pub activity_since: DateTime<Utc>,
+}
+
+/// Activity evidence for one collector platform.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CollectorReport {
+    /// Platform tag as recorded on ingested packages, e.g. `crates.io`.
+    pub platform: String,
+    pub packages: usize,
+    /// Most recent ingest timestamp observed for this platform.
+    pub last_activity: Option<DateTime<Utc>>,
+    /// Seconds since `last_activity`, for convenience when rendering.
+    pub seconds_since_activity: Option<i64>,
+}
+
+/// A task currently claimed by some worker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClaimReport {
+    pub version_id: u64,
+    pub held_for_seconds: u64,
+}
+
+/// `GET /admin/workers`: worker key liveness, in-flight tasks and throughput.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkerReport {
+    /// Worker keys and when each last authenticated.
+    pub keys: Vec<ApiKeyInfo>,
+    /// When in-memory key activity tracking started, i.e. server start.
+    pub activity_since: DateTime<Utc>,
+    /// Tasks checked out right now. This is the closest available proxy for
+    /// "workers currently busy"; it counts tasks, not processes.
+    pub active_claims: Vec<ClaimReport>,
+    pub total_analyses: usize,
+    pub last_analysis: Option<DateTime<Utc>>,
+    pub seconds_since_analysis: Option<i64>,
+    /// How long a claim may be held before it is considered abandoned.
+    pub claim_ttl_seconds: u64,
+}
+
+/// `GET /admin/status`: server uptime and table sizes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StatusReport {
+    pub started_at: DateTime<Utc>,
+    pub uptime_seconds: i64,
+    pub packages: usize,
+    pub versions: usize,
+    pub accounts: usize,
+    pub timeline_events: usize,
+    pub analyses: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Package {
     pub id: u64,

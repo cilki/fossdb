@@ -451,7 +451,7 @@ fn print_subscriptions(args: &Args, subscriptions: &[fossdb::PackageSubscription
 
 #[cfg(feature = "admin")]
 async fn admin_command(args: &Args, socket: &str, command: &AdminCommand) -> Result<()> {
-    use fossdb_admin_types::{CollectorsReport, StatusReport, WorkerReport};
+    use fossdb::{CollectorsReport, StatusReport, WorkerReport};
 
     match command {
         AdminCommand::Collectors => {
@@ -715,60 +715,6 @@ fn format_age(seconds: i64) -> String {
     }
 
     format!("{} ago", format_span(seconds))
-}
-
-/// Mirrors of the server's admin report types.
-///
-/// Declared here rather than depending on `fossdb-server`: the CLI must build
-/// without the server's database stack, and these are a stable JSON contract
-/// a few fields wide.
-#[cfg(feature = "admin")]
-mod fossdb_admin_types {
-    use chrono::{DateTime, Utc};
-    use serde::{Deserialize, Serialize};
-
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct CollectorsReport {
-        pub keys: Vec<fossdb::ApiKeyInfo>,
-        pub platforms: Vec<CollectorReport>,
-        pub activity_since: DateTime<Utc>,
-    }
-
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct CollectorReport {
-        pub platform: String,
-        pub packages: usize,
-        pub last_activity: Option<DateTime<Utc>>,
-        pub seconds_since_activity: Option<i64>,
-    }
-
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct ClaimReport {
-        pub version_id: u64,
-        pub held_for_seconds: u64,
-    }
-
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct WorkerReport {
-        pub keys: Vec<fossdb::ApiKeyInfo>,
-        pub activity_since: DateTime<Utc>,
-        pub active_claims: Vec<ClaimReport>,
-        pub total_analyses: usize,
-        pub last_analysis: Option<DateTime<Utc>>,
-        pub seconds_since_analysis: Option<i64>,
-        pub claim_ttl_seconds: u64,
-    }
-
-    #[derive(Debug, Serialize, Deserialize)]
-    pub struct StatusReport {
-        pub started_at: DateTime<Utc>,
-        pub uptime_seconds: i64,
-        pub packages: usize,
-        pub versions: usize,
-        pub accounts: usize,
-        pub timeline_events: usize,
-        pub analyses: usize,
-    }
 }
 
 #[cfg(test)]
