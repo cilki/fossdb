@@ -179,10 +179,11 @@ async fn status(State(state): State<AppState>) -> Result<Json<StatusReport>, Sta
     Ok(Json(report))
 }
 
-/// Decorate stored keys of one role with their in-memory last-seen times.
-fn keys_for_role(
+/// The stored keys `keep` selects, decorated with their in-memory last-seen
+/// times.
+fn key_infos(
     state: &AppState,
-    role: fossdb::ApiKeyRole,
+    keep: impl Fn(&fossdb::ApiKey) -> bool,
 ) -> Result<Vec<fossdb::ApiKeyInfo>, StatusCode> {
     let stored = state.db.get_all_api_keys().map_err(internal)?;
     let now = Utc::now();
@@ -192,23 +193,28 @@ fn keys_for_role(
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
 
-    let mut keys: Vec<fossdb::ApiKeyInfo> = stored
+    Ok(stored
         .into_iter()
-        .filter(|key| key.role == role)
-        // A revoked key is not an instance; leave it out of liveness output.
-        .filter(|key| key.revoked_at.is_none())
+        .filter(|key| keep(key))
         .map(|key| {
             let last_used_at = activity.last_seen(&key.key_id);
-            let mut info = fossdb::ApiKeyInfo::from(key.inner.clone());
+            let mut info = fossdb::ApiKeyInfo::from(key.inner);
             info.last_used_at = last_used_at;
             info.seconds_since_use = last_used_at.map(|t| (now - t).num_seconds());
             info
         })
-        .collect();
+        .collect())
+}
 
-    // Most recently active first; never-used keys sort last.
+/// The live keys of one role, most recently active first.
+fn keys_for_role(
+    state: &AppState,
+    role: fossdb::ApiKeyRole,
+) -> Result<Vec<fossdb::ApiKeyInfo>, StatusCode> {
+    // A revoked key is not an instance; leave it out of liveness output.
+    let mut keys = key_infos(state, |key| key.role == role && key.revoked_at.is_none())?;
+    // Never-used keys sort last.
     keys.sort_by(|a, b| b.last_used_at.cmp(&a.last_used_at));
-
     Ok(keys)
 }
 
@@ -302,26 +308,7 @@ async fn list_api_keys(
     State(state): State<AppState>,
     Query(params): Query<ListKeysQuery>,
 ) -> Result<Json<Vec<fossdb::ApiKeyInfo>>, StatusCode> {
-    let stored = state.db.get_all_api_keys().map_err(internal)?;
-    let now = Utc::now();
-
-    let activity = state.key_activity.lock().map_err(|_| {
-        tracing::error!("key activity mutex poisoned");
-        StatusCode::INTERNAL_SERVER_ERROR
-    })?;
-
-    let mut keys: Vec<fossdb::ApiKeyInfo> = stored
-        .into_iter()
-        .filter(|key| params.all || key.revoked_at.is_none())
-        .map(|key| {
-            let last_used_at = activity.last_seen(&key.key_id);
-            let mut info = fossdb::ApiKeyInfo::from(key.inner.clone());
-            info.last_used_at = last_used_at;
-            info.seconds_since_use = last_used_at.map(|t| (now - t).num_seconds());
-            info
-        })
-        .collect();
-
+    let mut keys = key_infos(&state, |key| params.all || key.revoked_at.is_none())?;
     keys.sort_by(|a, b| a.created_at.cmp(&b.created_at));
 
     Ok(Json(keys))

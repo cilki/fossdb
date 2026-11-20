@@ -43,20 +43,6 @@ macro_rules! impl_get_all {
     };
 }
 
-macro_rules! impl_update {
-    ($method:ident, $type:ty) => {
-        pub fn $method(&self, entity: $type) -> Result<()> {
-            let rw = self.db.rw_transaction()?;
-            if let Some(old) = rw.get().primary::<$type>(entity.id)? {
-                rw.remove(old)?;
-            }
-            rw.insert(entity)?;
-            rw.commit()?;
-            Ok(())
-        }
-    };
-}
-
 macro_rules! find_max_id {
     ($tx:expr, $type:ty) => {
         $tx.scan()
@@ -179,7 +165,15 @@ impl Database {
     }
 
     impl_get_all!(get_all_packages, Package);
-    impl_update!(update_package, Package);
+
+    /// Overwrite the stored row with `row`'s primary key, or insert `row` if
+    /// there is none.
+    pub fn update<T: ToInput>(&self, row: T) -> Result<()> {
+        let rw = self.db.rw_transaction()?;
+        rw.upsert(row)?;
+        rw.commit()?;
+        Ok(())
+    }
 
     impl_insert!(insert_version, PackageVersion, version_ids);
     impl_get!(get_version, PackageVersion);
@@ -222,16 +216,6 @@ impl Database {
 
     impl_get_all!(get_all_users, User);
 
-    pub fn update_user(&self, user: User) -> Result<()> {
-        let rw = self.db.rw_transaction()?;
-        if let Some(old) = rw.get().primary::<User>(user.user_id.clone())? {
-            rw.remove(old)?;
-        }
-        rw.insert(user)?;
-        rw.commit()?;
-        Ok(())
-    }
-
     /// Delete an account and every timeline event belonging to it.
     ///
     /// Both happen in one transaction: a half-applied delete would leave
@@ -259,14 +243,11 @@ impl Database {
         Ok(true)
     }
 
-    impl_insert!(insert_vulnerability, Vulnerability, vulnerability_ids);
     impl_get!(get_vulnerability, Vulnerability);
     impl_get_all!(get_all_vulnerabilities, Vulnerability);
 
     impl_insert!(insert_timeline_event, TimelineEvent, timeline_ids);
-    impl_get!(get_timeline_event, TimelineEvent);
     impl_get_all!(get_all_timeline_events, TimelineEvent);
-    impl_update!(update_timeline_event, TimelineEvent);
 
     pub fn get_timeline_events_by_user(&self, user_id: &str) -> Result<Vec<TimelineEvent>> {
         let r = self.db.r_transaction()?;
@@ -365,11 +346,7 @@ impl Database {
         Ok(r.get().primary(key_id.to_string())?)
     }
 
-    pub fn get_all_api_keys(&self) -> Result<Vec<ApiKey>> {
-        let r = self.db.r_transaction()?;
-        let all: Vec<ApiKey> = r.scan().primary()?.all()?.collect::<Result<Vec<_>, _>>()?;
-        Ok(all)
-    }
+    impl_get_all!(get_all_api_keys, ApiKey);
 
     /// Mark a key revoked.
     ///

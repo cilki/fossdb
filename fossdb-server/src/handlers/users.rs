@@ -134,7 +134,7 @@ pub fn subscribe(
             package_name: package_name.to_string(),
             notifications_enabled: true,
         });
-        db.update_user(user.clone())?;
+        db.update(user.clone())?;
     }
 
     let lookalike = match lookalikes.check(db, &package) {
@@ -163,7 +163,7 @@ pub async fn remove_subscription(
 
     state
         .db
-        .update_user(user.clone())
+        .update(user.clone())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(SubscriptionResponse {
@@ -193,7 +193,7 @@ pub async fn update_notification_settings(
 
     state
         .db
-        .update_user(user)
+        .update(user)
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(NotificationSettingsResponse {
@@ -221,7 +221,7 @@ pub async fn update_package_notification(
 
     state
         .db
-        .update_user(user.clone())
+        .update(user.clone())
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(SubscriptionResponse {
