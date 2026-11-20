@@ -36,7 +36,8 @@ use axum::{
     routing::{delete, get, post},
 };
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+use fossdb::{ClaimReport, CollectorReport, CollectorsReport, StatusReport, WorkerReport};
 use tokio::net::UnixListener;
 
 use crate::AppState;
@@ -46,62 +47,6 @@ use crate::AppState;
 /// Explicitly set rather than left to the process umask, which would
 /// otherwise decide whether this control channel is world-writable.
 const SOCKET_MODE: u32 = 0o660;
-
-/// Report for one role, combining key liveness with role-specific evidence.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CollectorsReport {
-    /// Collector keys and when each last authenticated.
-    pub keys: Vec<fossdb::ApiKeyInfo>,
-    pub platforms: Vec<CollectorReport>,
-    /// True if key activity has been reset by a restart.
-    pub activity_since: DateTime<Utc>,
-}
-
-/// Activity evidence for one collector platform.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CollectorReport {
-    /// Platform tag as recorded on ingested packages, e.g. `crates.io`.
-    pub platform: String,
-    pub packages: usize,
-    /// Most recent ingest timestamp observed for this platform.
-    pub last_activity: Option<DateTime<Utc>>,
-    /// Seconds since `last_activity`, for convenience when rendering.
-    pub seconds_since_activity: Option<i64>,
-}
-
-/// A task currently claimed by some worker.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ClaimReport {
-    pub version_id: u64,
-    pub held_for_seconds: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WorkerReport {
-    /// Worker keys and when each last authenticated.
-    pub keys: Vec<fossdb::ApiKeyInfo>,
-    /// True if key activity has been reset by a restart.
-    pub activity_since: DateTime<Utc>,
-    /// Tasks checked out right now. This is the closest available proxy for
-    /// "workers currently busy"; it counts tasks, not processes.
-    pub active_claims: Vec<ClaimReport>,
-    pub total_analyses: usize,
-    pub last_analysis: Option<DateTime<Utc>>,
-    pub seconds_since_analysis: Option<i64>,
-    /// How long a claim may be held before it is considered abandoned.
-    pub claim_ttl_seconds: u64,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct StatusReport {
-    pub started_at: DateTime<Utc>,
-    pub uptime_seconds: i64,
-    pub packages: usize,
-    pub versions: usize,
-    pub accounts: usize,
-    pub timeline_events: usize,
-    pub analyses: usize,
-}
 
 /// Bind the socket and serve until the process exits.
 ///
