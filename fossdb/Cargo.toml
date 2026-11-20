@@ -9,6 +9,7 @@ edition.workspace = true
 
 [dependencies]
 chrono.workspace = true
+percent-encoding = "2.3"
 serde.workspace = true
 
 [dev-dependencies]

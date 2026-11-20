@@ -1,5 +1,14 @@
 //! URL helpers shared by every client of the fossdb API.
 
+use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, utf8_percent_encode};
+
+/// Every byte except the RFC 3986 unreserved set (`ALPHA / DIGIT / - . _ ~`).
+const NOT_UNRESERVED: &AsciiSet = &NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~');
+
 /// Percent-encode a value for use as one URL path segment or query value.
 ///
 /// Everything outside the RFC 3986 unreserved set is escaped, byte by byte
@@ -8,16 +17,7 @@
 /// them hit a different route, arrive as spaces, truncate the URL or inject
 /// extra query parameters.
 pub fn percent_encode(value: &str) -> String {
-    let mut out = String::with_capacity(value.len());
-    for byte in value.bytes() {
-        match byte {
-            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                out.push(byte as char)
-            }
-            _ => out.push_str(&format!("%{byte:02X}")),
-        }
-    }
-    out
+    utf8_percent_encode(value, NOT_UNRESERVED).to_string()
 }
 
 #[cfg(test)]
