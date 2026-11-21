@@ -3,6 +3,7 @@
 //! The account id is the whole credential, so the file holding it is as
 //! sensitive as an SSH private key and is created with the same permissions.
 
+use std::ffi::OsString;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -37,14 +38,20 @@ pub fn normalize_server(server: &str) -> String {
 /// Hand-rolled rather than pulling in a crate: the rule is two lines, and
 /// `$XDG_CONFIG_HOME` is only honoured when absolute, as the spec requires.
 pub fn path() -> Result<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        let candidate = PathBuf::from(&xdg);
+    resolve_path(std::env::var_os("XDG_CONFIG_HOME"), std::env::var_os("HOME"))
+}
+
+/// [`path`] with the environment passed in, so tests need not mutate the
+/// process-wide environment (which races with every other test thread).
+fn resolve_path(xdg_config_home: Option<OsString>, home: Option<OsString>) -> Result<PathBuf> {
+    if let Some(xdg) = xdg_config_home {
+        let candidate = PathBuf::from(xdg);
         if candidate.is_absolute() {
             return Ok(candidate.join("fossdb").join("credentials.json"));
         }
     }
 
-    let home = std::env::var_os("HOME")
+    let home = home
         .map(PathBuf::from)
         .context("neither XDG_CONFIG_HOME nor HOME is set; cannot locate a config directory")?;
 
@@ -140,11 +147,8 @@ mod tests {
 
     #[test]
     fn honours_absolute_xdg_config_home() {
-        // Serialised via a lock in the parent module's test setup would be
-        // nicer, but these two vars are only read here.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", "/tmp/xdg-test") };
-        let resolved = path().unwrap();
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        let resolved =
+            resolve_path(Some("/tmp/xdg-test".into()), Some("/home/someone".into())).unwrap();
 
         assert_eq!(
             resolved,
@@ -155,15 +159,28 @@ mod tests {
     #[test]
     fn ignores_relative_xdg_config_home() {
         // The spec says a relative XDG_CONFIG_HOME must be treated as unset.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", "relative/path") };
-        unsafe { std::env::set_var("HOME", "/home/someone") };
-        let resolved = path().unwrap();
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        let resolved =
+            resolve_path(Some("relative/path".into()), Some("/home/someone".into())).unwrap();
 
         assert_eq!(
             resolved,
             PathBuf::from("/home/someone/.config/fossdb/credentials.json")
         );
+    }
+
+    #[test]
+    fn falls_back_to_home_without_xdg_config_home() {
+        let resolved = resolve_path(None, Some("/home/someone".into())).unwrap();
+
+        assert_eq!(
+            resolved,
+            PathBuf::from("/home/someone/.config/fossdb/credentials.json")
+        );
+    }
+
+    #[test]
+    fn fails_without_xdg_config_home_or_home() {
+        assert!(resolve_path(None, None).is_err());
     }
 
     #[test]
