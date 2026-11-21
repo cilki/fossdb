@@ -257,6 +257,50 @@ pub fn emit_lookalike_alert(
     );
 }
 
+/// Tell the subscribers of `package` that stored `versions` have just been
+/// yanked upstream: one event per package per ingest, however many versions
+/// it names.
+///
+/// A [`EventType::BehaviorChange`], since most yanks are releases published
+/// by mistake; but a yank is also often the first public sign of a bad or
+/// compromised release, well before any advisory, so anyone who already
+/// upgraded should know.
+pub fn emit_yank_alert(
+    db: &Database,
+    broadcaster: &TimelineBroadcaster,
+    package: &fossdb::Package,
+    versions: &[String],
+) {
+    tracing::info!("{} yanked: {}", package.name, versions.join(", "));
+    let from = package
+        .platform
+        .as_deref()
+        .map(|p| format!(" from {p}"))
+        .unwrap_or_default();
+    let message = match versions {
+        [one] => format!("{} {one} was yanked{from}", package.name),
+        many => format!("{} {} were yanked{from}", package.name, many.join(", ")),
+    };
+    notify_subscribers(
+        db,
+        broadcaster,
+        fossdb::TimelineEvent {
+            id: 0,
+            package_id: package.id,
+            user_id: None,
+            event_type: EventType::BehaviorChange,
+            package_name: package.name.clone(),
+            version: match versions {
+                [one] => Some(one.clone()),
+                _ => None,
+            },
+            message,
+            metadata: Some(serde_json::json!({ "yanked_versions": versions }).to_string()),
+            created_at: Utc::now(),
+        },
+    );
+}
+
 /// An install hook that a newly analysed version has and its baseline did not
 /// have in the same form.
 #[derive(Debug, PartialEq)]
@@ -585,6 +629,7 @@ mod tests {
                         vulnerabilities: Vec::new(),
                         changelog: None,
                         created_at: now,
+                        yanked_at: None,
                     },
                 })
                 .unwrap()

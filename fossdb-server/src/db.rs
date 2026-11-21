@@ -7,7 +7,7 @@ use crate::id_generator::IdGenerator;
 use crate::models::{
     PackageKey, PackageVersionKey, TimelineEventKey, VulnerabilityKey, WorkerAnalysisKey,
 };
-use crate::models::{ApiKey, VulnerabilityV1, WorkerAnalysis};
+use crate::models::{ApiKey, PackageVersionV1, VulnerabilityV1, WorkerAnalysis};
 use crate::*;
 
 macro_rules! impl_insert {
@@ -57,6 +57,7 @@ macro_rules! find_max_id {
 static MODELS: Lazy<Models> = Lazy::new(|| {
     let mut models = Models::new();
     models.define::<Package>().unwrap();
+    models.define::<PackageVersionV1>().unwrap();
     models.define::<PackageVersion>().unwrap();
     models.define::<User>().unwrap();
     models.define::<VulnerabilityV1>().unwrap();
@@ -83,6 +84,7 @@ impl Database {
         // Before the max-id scan below: until they are migrated, v1 rows are
         // invisible to it, and the generator would reissue their ids.
         let rw = db.rw_transaction()?;
+        rw.migrate::<PackageVersion>()?;
         rw.migrate::<Vulnerability>()?;
         rw.commit()?;
 
@@ -189,6 +191,17 @@ impl Database {
     }
 
     impl_get_all!(get_all_versions, PackageVersion);
+
+    /// Replace a stored version in place.
+    ///
+    /// `update`, not `upsert` or `remove` + `insert`: the `PackageVersion`
+    /// watch in [`crate::db_listener`] announces every insert as a release.
+    pub fn update_version(&self, old: PackageVersion, new: PackageVersion) -> Result<()> {
+        let rw = self.db.rw_transaction()?;
+        rw.update(old, new)?;
+        rw.commit()?;
+        Ok(())
+    }
 
     /// Insert a user whose `user_id` has already been generated.
     ///
@@ -579,6 +592,49 @@ mod tests {
         let outcome = db.upsert_advisory(fresh, &HashMap::new()).unwrap();
         assert!(outcome.created);
         assert_eq!(outcome.vulnerability.id, 8);
+    }
+
+    /// A database written before `yanked_at` existed must open with its
+    /// versions live, still findable by package, and their ids not reissued.
+    #[test]
+    fn v1_package_versions_migrate_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("db");
+
+        {
+            let mut v1_only = Models::new();
+            v1_only.define::<PackageVersionV1>().unwrap();
+            let db = Builder::new().create(&v1_only, &path).unwrap();
+            let rw = db.rw_transaction().unwrap();
+            rw.insert(PackageVersionV1 {
+                id: 5,
+                package_id: 3,
+                version: "1.0.0".into(),
+                release_date: chrono::Utc::now(),
+                download_url: Some("https://crates.io/x".into()),
+                checksum: None,
+                dependencies: Vec::new(),
+                vulnerabilities: vec!["2".into()],
+                changelog: None,
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+            rw.commit().unwrap();
+        }
+
+        let db = Database::new(path.to_str().unwrap()).unwrap();
+
+        let migrated = db.get_versions_by_package(3).unwrap();
+        assert_eq!(migrated.len(), 1);
+        assert_eq!(migrated[0].id, 5);
+        assert_eq!(migrated[0].version, "1.0.0");
+        assert_eq!(migrated[0].vulnerabilities, ["2"]);
+        assert_eq!(migrated[0].yanked_at, None);
+
+        let mut fresh = migrated[0].clone();
+        fresh.inner.id = 0;
+        fresh.inner.version = "1.0.1".into();
+        assert_eq!(db.insert_version(fresh).unwrap().id, 6);
     }
 
     fn package(id: u64, name: &str, description: &str) -> Package {

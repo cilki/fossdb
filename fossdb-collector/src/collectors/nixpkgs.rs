@@ -277,6 +277,7 @@ impl Collector for NixpkgsCollector {
                         changelog: package_meta
                             .as_ref()
                             .and_then(|m| m.meta.changelog.clone()),
+                        yanked: None,
                     }],
                     platform: None,
                     language: None,
@@ -340,6 +341,7 @@ impl Collector for NixpkgsCollector {
                     checksum: None,
                     dependencies: Vec::new(),
                     changelog: package_meta.as_ref().and_then(|m| m.meta.changelog.clone()),
+                    yanked: None,
                 }]
             } else {
                 Vec::new()

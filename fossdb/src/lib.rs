@@ -174,6 +174,10 @@ pub struct PackageVersion {
     pub vulnerabilities: Vec<String>,
     pub changelog: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// When FossDB first saw this version yanked upstream, or `None` while it
+    /// is live. Cleared again if the version is un-yanked.
+    #[serde(default)]
+    pub yanked_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -421,6 +425,14 @@ pub struct CollectedVersion {
     pub checksum: Option<String>,
     pub dependencies: Vec<Dependency>,
     pub changelog: Option<String>,
+    /// Whether the source lists this version as yanked, or `None` if the
+    /// source has no notion of yanking.
+    ///
+    /// A stored version sent with `Some` that differs from its stored state
+    /// is marked yanked or live again. A version FossDB does not have yet is
+    /// not stored at all if it is already yanked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub yanked: Option<bool>,
 }
 
 /// A published security advisory, as sent by a collector to
@@ -498,6 +510,11 @@ pub struct PackageVulnerability {
 pub struct PackageLookup {
     pub package: Package,
     pub version_strings: Vec<String>,
+    /// The subset of `version_strings` stored as yanked, so a collector can
+    /// send only the versions whose yank state changed. Absent from servers
+    /// that predate yank tracking.
+    #[serde(default)]
+    pub yanked_versions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -258,6 +258,8 @@ impl LibrariesIoCollector {
                 checksum: None,
                 dependencies: deps,
                 changelog: None,
+                // libraries.io does not relay per-version yanks.
+                yanked: None,
             });
         }
 

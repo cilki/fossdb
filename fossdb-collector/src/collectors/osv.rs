@@ -836,6 +836,7 @@ mod tests {
                 rank: None,
             },
             version_strings: versions.iter().map(|v| v.to_string()).collect(),
+            yanked_versions: Vec::new(),
         }
     }
 

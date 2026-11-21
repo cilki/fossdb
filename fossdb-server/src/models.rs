@@ -40,9 +40,42 @@ impl Package {
 
 impl_deref!(Package, fossdb::Package);
 
+/// The version 1 `PackageVersion` row, kept only so that
+/// [`crate::db::Database::new`] can migrate it to version 2.
+///
+/// Field order must match what was encoded: rows are stored positionally.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[native_model(id = 2, version = 1)]
+#[native_db(
+    primary_key(id -> u64),
+    secondary_key(package_id -> u64),
+)]
+pub struct PackageVersionV1 {
+    pub id: u64,
+    pub package_id: u64,
+    pub version: String,
+    pub release_date: chrono::DateTime<chrono::Utc>,
+    pub download_url: Option<String>,
+    pub checksum: Option<String>,
+    pub dependencies: Vec<fossdb::Dependency>,
+    pub vulnerabilities: Vec<String>,
+    pub changelog: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl PackageVersionV1 {
+    fn id(&self) -> u64 {
+        self.id
+    }
+    fn package_id(&self) -> u64 {
+        self.package_id
+    }
+}
+
+/// Version 2 adds `yanked_at`. v1 rows migrate as live versions.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
-#[native_model(id = 2, version = 1)]
+#[native_model(id = 2, version = 2, from = PackageVersionV1)]
 #[native_db(
     primary_key(id -> u64),
     secondary_key(package_id -> u64),
@@ -57,6 +90,44 @@ impl PackageVersion {
     }
     fn package_id(&self) -> u64 {
         self.package_id
+    }
+}
+
+impl From<PackageVersionV1> for PackageVersion {
+    fn from(v: PackageVersionV1) -> Self {
+        Self {
+            inner: fossdb::PackageVersion {
+                id: v.id,
+                package_id: v.package_id,
+                version: v.version,
+                release_date: v.release_date,
+                download_url: v.download_url,
+                checksum: v.checksum,
+                dependencies: v.dependencies,
+                vulnerabilities: v.vulnerabilities,
+                changelog: v.changelog,
+                created_at: v.created_at,
+                yanked_at: None,
+            },
+        }
+    }
+}
+
+impl From<PackageVersion> for PackageVersionV1 {
+    fn from(v: PackageVersion) -> Self {
+        let v = v.inner;
+        Self {
+            id: v.id,
+            package_id: v.package_id,
+            version: v.version,
+            release_date: v.release_date,
+            download_url: v.download_url,
+            checksum: v.checksum,
+            dependencies: v.dependencies,
+            vulnerabilities: v.vulnerabilities,
+            changelog: v.changelog,
+            created_at: v.created_at,
+        }
     }
 }
 

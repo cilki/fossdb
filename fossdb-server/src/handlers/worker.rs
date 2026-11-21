@@ -6,7 +6,17 @@ use axum::{
 use fossdb::{WorkerAnalysis as FossdbWorkerAnalysis, WorkerTask};
 
 use crate::db_listener::emit_install_hook_changes;
-use crate::{AppState, WorkerAnalysis};
+use crate::{AppState, PackageVersion, WorkerAnalysis};
+
+/// The version of a package the worker should analyse: the latest live one
+/// that can be downloaded. A yanked release is not what anyone should be
+/// upgrading to, so the one before it is the package's current release.
+fn task_version(versions: Vec<PackageVersion>) -> Option<PackageVersion> {
+    versions
+        .into_iter()
+        .filter(|v| v.download_url.is_some() && v.yanked_at.is_none())
+        .max_by_key(|v| v.id)
+}
 
 pub async fn get_task(
     State(state): State<AppState>,
@@ -31,8 +41,7 @@ pub async fn get_task(
             .get_versions_by_package(pkg.id)
             .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
-        // Pick the latest version that has a download URL
-        let Some(version) = versions.into_iter().filter(|v| v.download_url.is_some()).max_by_key(|v| v.id) else {
+        let Some(version) = task_version(versions) else {
             continue;
         };
 
@@ -141,4 +150,41 @@ pub async fn get_package_analyses(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     Ok(Json(analyses.into_iter().map(|a| a.inner).collect()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn version(id: u64, download: bool, yanked: bool) -> PackageVersion {
+        PackageVersion {
+            inner: fossdb::PackageVersion {
+                id,
+                package_id: 1,
+                version: format!("1.{id}.0"),
+                release_date: Utc::now(),
+                download_url: download.then(|| format!("https://example.invalid/{id}")),
+                checksum: None,
+                dependencies: Vec::new(),
+                vulnerabilities: Vec::new(),
+                changelog: None,
+                created_at: Utc::now(),
+                yanked_at: yanked.then(Utc::now),
+            },
+        }
+    }
+
+    #[test]
+    fn task_version_passes_over_yanked_and_undownloadable_releases() {
+        let picked = task_version(vec![
+            version(1, true, false),
+            version(2, true, false),
+            version(3, false, false),
+            version(4, true, true),
+        ]);
+        assert_eq!(picked.map(|v| v.id), Some(2));
+
+        assert!(task_version(vec![version(1, true, true)]).is_none());
+    }
 }

@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::AppState;
 use crate::db::Database;
-use crate::db_listener::{emit_lookalike_alert, emit_security_alerts};
+use crate::db_listener::{emit_lookalike_alert, emit_security_alerts, emit_yank_alert};
 use crate::lookalike::LookalikeTargets;
 use crate::websocket::TimelineBroadcaster;
 use crate::{Package, PackageVersion, Vulnerability};
@@ -26,22 +26,31 @@ pub async fn get_package(
     State(state): State<AppState>,
     Query(q): Query<PackageQuery>,
 ) -> Result<Json<PackageLookup>, StatusCode> {
-    match state.db.get_package_by_name(&q.name) {
-        Ok(Some(pkg)) => {
-            let version_strings = state.db
-                .get_versions_by_package(pkg.id)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|v| v.version.clone())
-                .collect();
-            Ok(Json(PackageLookup {
-                package: pkg.inner,
-                version_strings,
-            }))
-        }
+    match package_lookup(&state.db, &q.name) {
+        Ok(Some(lookup)) => Ok(Json(lookup)),
         Ok(None) => Err(StatusCode::NOT_FOUND),
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
+}
+
+/// A stored package with the versions a collector need not send again, or
+/// `None` if there is no package of that name.
+pub fn package_lookup(db: &Database, name: &str) -> anyhow::Result<Option<PackageLookup>> {
+    let Some(pkg) = db.get_package_by_name(name)? else {
+        return Ok(None);
+    };
+    let versions = db.get_versions_by_package(pkg.id).unwrap_or_default();
+    let yanked_versions = versions
+        .iter()
+        .filter(|v| v.yanked_at.is_some())
+        .map(|v| v.version.clone())
+        .collect();
+    let version_strings = versions.into_iter().map(|v| v.inner.version).collect();
+    Ok(Some(PackageLookup {
+        package: pkg.inner,
+        version_strings,
+        yanked_versions,
+    }))
 }
 
 pub async fn upsert_package(
@@ -62,6 +71,10 @@ pub async fn upsert_package(
 /// A package new to the database is checked against the popular names of
 /// its ecosystem; if it imitates one, that package's subscribers get a
 /// `SecurityAlert` (see [`crate::db_listener::emit_lookalike_alert`]).
+///
+/// Stored versions sent with a different [`fossdb::CollectedVersion::yanked`]
+/// are marked yanked or live again; the package's subscribers hear about the
+/// yanks (see [`crate::db_listener::emit_yank_alert`]).
 pub fn store_package(
     db: &Database,
     broadcaster: &TimelineBroadcaster,
@@ -74,11 +87,11 @@ pub fn store_package(
 
     let (package, known_versions) = match existing {
         Some(existing) => {
-            let known: HashSet<String> = db
+            let known: HashMap<String, PackageVersion> = db
                 .get_versions_by_package(existing.id)
                 .unwrap_or_default()
                 .into_iter()
-                .map(|v| v.inner.version)
+                .map(|v| (v.version.clone(), v))
                 .collect();
             (existing, known)
         }
@@ -109,7 +122,7 @@ pub fn store_package(
                 Ok(None) => {}
                 Err(e) => tracing::error!("Lookalike check for {} failed: {}", saved.name, e),
             }
-            (saved, HashSet::new())
+            (saved, HashMap::new())
         }
     };
 
@@ -125,8 +138,25 @@ pub fn store_package(
     versions.sort_by_key(|v| v.release_date);
 
     // Each insert is announced by the PackageVersion watch in db_listener.
+    let mut newly_yanked = Vec::new();
     for v in versions {
-        if known_versions.contains(&v.version) {
+        if let Some(stored) = known_versions.get(&v.version) {
+            let Some(yanked) = v.yanked else { continue };
+            if yanked == stored.yanked_at.is_some() {
+                continue;
+            }
+            let mut updated = stored.clone();
+            updated.inner.yanked_at = yanked.then_some(now);
+            match db.update_version(stored.clone(), updated) {
+                Ok(()) if yanked => newly_yanked.push(v.version),
+                Ok(()) => tracing::info!("{} {} is no longer yanked", package.name, v.version),
+                Err(e) => tracing::error!("Failed to update yank state of {} {}: {}", package.name, v.version, e),
+            }
+            continue;
+        }
+        if v.yanked == Some(true) {
+            // Nobody can have upgraded to a version that was gone before
+            // FossDB saw it, so there is nothing to store or tell anyone.
             continue;
         }
         let version = PackageVersion {
@@ -141,11 +171,16 @@ pub fn store_package(
                 vulnerabilities: Vec::new(),
                 changelog: v.changelog,
                 created_at: now,
+                yanked_at: None,
             },
         };
         if let Err(e) = db.insert_version(version) {
             tracing::error!("Failed to insert version: {}", e);
         }
+    }
+
+    if !newly_yanked.is_empty() {
+        emit_yank_alert(db, broadcaster, &package, &newly_yanked);
     }
 
     Ok(package.inner)
@@ -368,6 +403,7 @@ mod tests {
                     vulnerabilities: Vec::new(),
                     changelog: None,
                     created_at: now,
+                    yanked_at: None,
                 },
             })
             .unwrap();
@@ -664,6 +700,7 @@ mod tests {
                     })
                     .collect(),
                 changelog: None,
+                yanked: None,
             }],
             platform: Some(platform.into()),
             language: None,
@@ -699,6 +736,7 @@ mod tests {
                     checksum: None,
                     dependencies: Vec::new(),
                     changelog: None,
+                    yanked: None,
                 })
                 .collect();
             package
@@ -729,6 +767,149 @@ mod tests {
             order(&db, package.id),
             ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"]
         );
+    }
+
+    /// `serde` as crates.io would send it: each version with its yank state.
+    fn crate_with(versions: &[(&str, Option<bool>)]) -> CollectedPackage {
+        let base = Utc::now() - chrono::Duration::days(30);
+        let mut package = collected("serde", "crates.io", None, &[]);
+        package.versions = versions
+            .iter()
+            .enumerate()
+            .map(|(day, (version, yanked))| fossdb::CollectedVersion {
+                version: (*version).into(),
+                release_date: base + chrono::Duration::days(day as i64),
+                download_url: None,
+                checksum: None,
+                dependencies: Vec::new(),
+                changelog: None,
+                yanked: *yanked,
+            })
+            .collect();
+        package
+    }
+
+    fn yanked(db: &Database, package_id: u64) -> Vec<String> {
+        let mut versions: Vec<String> = db
+            .get_versions_by_package(package_id)
+            .unwrap()
+            .into_iter()
+            .filter(|v| v.yanked_at.is_some())
+            .map(|v| v.inner.version)
+            .collect();
+        versions.sort();
+        versions
+    }
+
+    fn behavior_changes(db: &Database, user_id: &str) -> Vec<fossdb::TimelineEvent> {
+        db.get_timeline_events_by_user(user_id)
+            .unwrap()
+            .into_iter()
+            .map(|e| e.inner)
+            .filter(|e| e.event_type == fossdb::EventType::BehaviorChange)
+            .collect()
+    }
+
+    #[test]
+    fn yanking_a_stored_version_marks_it_and_tells_subscribers_once() {
+        let (_dir, db) = open_db();
+        let broadcaster = TimelineBroadcaster::new();
+        let lookalikes = LookalikeTargets::new();
+        let store = |p| store_package(&db, &broadcaster, &lookalikes, p).unwrap();
+        let package = store(crate_with(&[("1.0.0", Some(false)), ("1.0.1", Some(false))]));
+        subscribe(&db, "subscriber", "serde");
+        subscribe(&db, "bystander", "tokio");
+        let (recv, _id) = db.db.watch().scan().primary().all::<PackageVersion>().unwrap();
+
+        store(crate_with(&[("1.0.1", Some(true))]));
+
+        assert_eq!(yanked(&db, package.id), ["1.0.1"]);
+        let events = behavior_changes(&db, "subscriber");
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        assert_eq!(event.package_id, package.id);
+        assert_eq!(event.version.as_deref(), Some("1.0.1"));
+        assert_eq!(event.message, "serde 1.0.1 was yanked from crates.io");
+        let metadata: serde_json::Value =
+            serde_json::from_str(event.metadata.as_deref().unwrap()).unwrap();
+        assert_eq!(metadata["yanked_versions"], serde_json::json!(["1.0.1"]));
+        assert!(behavior_changes(&db, "bystander").is_empty());
+        // Marked in place, so the release watch does not announce it again.
+        let watched: Vec<_> = recv.try_iter().collect();
+        assert_eq!(watched.len(), 1);
+        assert!(matches!(watched[0], native_db::watch::Event::Update(_)), "{watched:?}");
+
+        // Still yanked on the next run: nothing new to say.
+        store(crate_with(&[("1.0.1", Some(true))]));
+        assert_eq!(behavior_changes(&db, "subscriber").len(), 1);
+
+        // Several yanks in one batch are one event.
+        store(crate_with(&[("1.0.0", Some(true)), ("1.0.1", Some(true))]));
+        let events = behavior_changes(&db, "subscriber");
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().any(|e| e.message == "serde 1.0.0 was yanked from crates.io"));
+    }
+
+    #[test]
+    fn unyanking_clears_the_mark_without_an_event() {
+        let (_dir, db) = open_db();
+        let broadcaster = TimelineBroadcaster::new();
+        let lookalikes = LookalikeTargets::new();
+        let store = |p| store_package(&db, &broadcaster, &lookalikes, p).unwrap();
+        let package = store(crate_with(&[("1.0.0", Some(false))]));
+        store(crate_with(&[("1.0.0", Some(true))]));
+        subscribe(&db, "subscriber", "serde");
+
+        // A source that knows nothing of yanks leaves the mark alone.
+        store(crate_with(&[("1.0.0", None)]));
+        assert_eq!(yanked(&db, package.id), ["1.0.0"]);
+
+        store(crate_with(&[("1.0.0", Some(false))]));
+        assert!(yanked(&db, package.id).is_empty());
+        assert!(behavior_changes(&db, "subscriber").is_empty());
+
+        let lookup = get_package_lookup(&db, "serde");
+        assert!(lookup.yanked_versions.is_empty());
+    }
+
+    #[test]
+    fn versions_yanked_before_they_were_seen_are_not_stored() {
+        let (_dir, db) = open_db();
+        let broadcaster = TimelineBroadcaster::new();
+        let lookalikes = LookalikeTargets::new();
+        let store = |p| store_package(&db, &broadcaster, &lookalikes, p).unwrap();
+        let package = store(crate_with(&[("1.0.0", Some(false)), ("1.0.1", Some(true))]));
+        store(crate_with(&[("1.0.2", Some(true)), ("1.0.3", None)]));
+
+        let mut versions: Vec<String> = db
+            .get_versions_by_package(package.id)
+            .unwrap()
+            .into_iter()
+            .map(|v| v.inner.version)
+            .collect();
+        versions.sort();
+        assert_eq!(versions, ["1.0.0", "1.0.3"]);
+        assert!(yanked(&db, package.id).is_empty());
+    }
+
+    #[test]
+    fn lookup_lists_the_yanked_versions() {
+        let (_dir, db) = open_db();
+        let broadcaster = TimelineBroadcaster::new();
+        let lookalikes = LookalikeTargets::new();
+        let store = |p| store_package(&db, &broadcaster, &lookalikes, p).unwrap();
+        store(crate_with(&[("1.0.0", Some(false)), ("1.0.1", Some(false))]));
+        store(crate_with(&[("1.0.0", Some(true))]));
+
+        let lookup = get_package_lookup(&db, "serde");
+        let mut versions = lookup.version_strings.clone();
+        versions.sort();
+        assert_eq!(versions, ["1.0.0", "1.0.1"]);
+        assert_eq!(lookup.yanked_versions, ["1.0.0"]);
+    }
+
+    fn get_package_lookup(db: &Database, name: &str) -> PackageLookup {
+        package_lookup(db, name).unwrap().unwrap()
     }
 
     #[test]
