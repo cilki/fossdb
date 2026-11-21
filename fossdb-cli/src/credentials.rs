@@ -21,6 +21,17 @@ pub struct Credentials {
     pub server: String,
 }
 
+/// Canonical form of a server base URL: without trailing slashes.
+///
+/// `https://fossdb.example/` and `https://fossdb.example` are the same
+/// deployment. Keeping the slash would both make the stored server differ from
+/// the slash-less `--server` (so the credential is refused as another
+/// deployment's) and put a `//` into every URL built from it, such as the feed
+/// URLs, which the server then answers with 404.
+pub fn normalize_server(server: &str) -> String {
+    server.trim_end_matches('/').to_string()
+}
+
 /// Resolve the credential file path per the XDG Base Directory spec.
 ///
 /// Hand-rolled rather than pulling in a crate: the rule is two lines, and
@@ -49,8 +60,12 @@ pub fn load() -> Result<Option<Credentials>> {
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
 
-    let credentials: Credentials = serde_json::from_str(&raw)
+    let mut credentials: Credentials = serde_json::from_str(&raw)
         .with_context(|| format!("{} is not valid credential JSON", path.display()))?;
+
+    // Files written before the server was normalised may still carry a
+    // trailing slash.
+    credentials.server = normalize_server(&credentials.server);
 
     // Guard against a file that was hand-edited into an unusable state.
     if !fossdb::user_id::is_well_formed(&credentials.user_id) {
@@ -148,6 +163,17 @@ mod tests {
         assert_eq!(
             resolved,
             PathBuf::from("/home/someone/.config/fossdb/credentials.json")
+        );
+    }
+
+    #[test]
+    fn server_trailing_slashes_are_dropped() {
+        assert_eq!(normalize_server("https://fossdb.example/"), "https://fossdb.example");
+        assert_eq!(normalize_server("https://fossdb.example//"), "https://fossdb.example");
+        assert_eq!(normalize_server("https://fossdb.example"), "https://fossdb.example");
+        assert_eq!(
+            normalize_server("https://example.org/fossdb/"),
+            "https://example.org/fossdb"
         );
     }
 

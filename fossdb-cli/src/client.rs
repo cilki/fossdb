@@ -30,7 +30,7 @@ impl Client {
 
         Ok(Self {
             http,
-            server: server.trim_end_matches('/').to_string(),
+            server: crate::credentials::normalize_server(server),
             user_id,
         })
     }

@@ -168,15 +168,16 @@ async fn run(args: &Args) -> Result<()> {
 
 /// Server for this invocation: explicit flag, then env, then the default.
 fn server(args: &Args) -> String {
-    args.server
-        .clone()
-        .unwrap_or_else(|| DEFAULT_SERVER.to_string())
+    credentials::normalize_server(args.server.as_deref().unwrap_or(DEFAULT_SERVER))
 }
 
 /// Build a client carrying the stored credential.
 fn authed_client(args: &Args) -> Result<(client::Client, credentials::Credentials)> {
     let stored = credentials::require()?;
-    let server = args.server.clone().unwrap_or_else(|| stored.server.clone());
+    let server = args
+        .server
+        .as_deref()
+        .map_or_else(|| stored.server.clone(), credentials::normalize_server);
 
     // Refuse to send one deployment's credential to another. Without this,
     // `--server` against an unrelated host would silently leak the id.
