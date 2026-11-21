@@ -89,6 +89,15 @@ fn hook_change_label(change: Option<InstallHookChange>, baseline: Option<&str>) 
     }
 }
 
+/// Tooltip for a yanked version's badge, e.g. `Yanked upstream (noticed
+/// 2026-11-21)`, or `None` while the version is live. The date is when FossDB
+/// saw the yank, not when the registry recorded it, so it says "noticed".
+fn yanked_tooltip(version: &PackageVersion) -> Option<String> {
+    version
+        .yanked_at
+        .map(|at| format!("Yanked upstream (noticed {})", at.format("%Y-%m-%d")))
+}
+
 /// E.g. `This name resembles colorama (one character different), which has
 /// 5000 dependents.`
 /// Targets always have several dependents (`MIN_TARGET_POPULARITY` on the
@@ -434,7 +443,23 @@ pub fn PackageDetail(id: String) -> Element {
                                         for version in displayed_versions().iter() {
                                             div { key: "{version.id}", class: "flex justify-between items-center p-4 bg-gray-700 rounded-lg",
                                                 div {
-                                                    div { class: "font-semibold text-gray-100", "{version.version}" }
+                                                    div { class: "flex items-center gap-2",
+                                                        span {
+                                                            class: if version.yanked_at.is_some() {
+                                                                "font-semibold text-gray-400 line-through"
+                                                            } else {
+                                                                "font-semibold text-gray-100"
+                                                            },
+                                                            "{version.version}"
+                                                        }
+                                                        if let Some(tooltip) = yanked_tooltip(version) {
+                                                            span {
+                                                                class: "px-2 py-0.5 rounded text-xs font-medium bg-red-900 text-red-300",
+                                                                title: "{tooltip}",
+                                                                "Yanked"
+                                                            }
+                                                        }
+                                                    }
                                                     div { class: "text-sm text-gray-400",
                                                         "Released: {version.release_date.format(\"%Y-%m-%d\")}"
                                                     }
@@ -726,6 +751,31 @@ mod tests {
         assert_eq!(hook_change_label(None, Some("1.3.0")), None);
         // A first analysis has nothing to be new relative to.
         assert_eq!(hook_change_label(Some(InstallHookChange::Added), None), None);
+    }
+
+    #[test]
+    fn only_yanked_versions_get_a_yanked_tooltip() {
+        use chrono::TimeZone;
+        let mut version = PackageVersion {
+            id: 1,
+            package_id: 1,
+            version: "1.0.1".into(),
+            release_date: Utc::now(),
+            download_url: None,
+            checksum: None,
+            dependencies: Vec::new(),
+            vulnerabilities: Vec::new(),
+            changelog: None,
+            created_at: Utc::now(),
+            yanked_at: None,
+        };
+        assert_eq!(yanked_tooltip(&version), None);
+
+        version.yanked_at = Some(Utc.with_ymd_and_hms(2026, 11, 21, 9, 30, 0).unwrap());
+        assert_eq!(
+            yanked_tooltip(&version).as_deref(),
+            Some("Yanked upstream (noticed 2026-11-21)")
+        );
     }
 
     #[test]
