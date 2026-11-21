@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::{
     Router,
     routing::{get, post, put},
@@ -13,6 +13,7 @@ use tracing::{error, info};
 
 use fossdb_server::{AppState, config::Config, db::Database, handlers, middleware};
 use fossdb_server::{Package, PackageVersion, User, Vulnerability, TimelineEvent};
+use fossdb_server::models::{ApiKey, WorkerAnalysis};
 
 use fossdb_server::websocket;
 
@@ -221,20 +222,51 @@ fn export_table<T: Serialize>(table_name: &str, data: Vec<T>, output_path: &Path
     Ok(())
 }
 
+/// Every table `export` writes by default and `import` accepts, named as the
+/// file stem each is written to.
+///
+/// This has to cover every table holding state that cannot be recollected.
+/// Analyses were missing for a while, so a backup and restore lost every
+/// analysis: the worker only re-analyses the newest version of each package,
+/// which left the install-hook alerts with no baseline to compare against.
+/// API keys were missing too, which locked out every collector and worker.
+const TABLES: &[&str] = &[
+    "packages",
+    "versions",
+    "users",
+    "vulnerabilities",
+    "timeline_events",
+    "analyses",
+    "api_keys",
+];
+
+/// Open the database for `export`/`import`.
+///
+/// redb takes an exclusive lock, so this fails while the server is running.
+/// The raw error ("Database already open. Cannot acquire lock.") does not say
+/// which process holds it, so say so here.
+fn open_offline(config: &Config) -> Result<Database> {
+    Database::new(&config.database_path).with_context(|| {
+        format!(
+            "opening {}; if fossdb-server is running against it, stop it first \
+             (the database is locked while it is open)",
+            config.database_path
+        )
+    })
+}
+
 async fn export_database(config: &Config, output_dir: PathBuf, table: Option<String>) -> Result<()> {
-    let db = Database::new(&config.database_path)?;
-    std::fs::create_dir_all(&output_dir)?;
+    let db = open_offline(config)?;
+    export_tables(&db, &output_dir, table)
+}
+
+fn export_tables(db: &Database, output_dir: &Path, table: Option<String>) -> Result<()> {
+    std::fs::create_dir_all(output_dir)?;
 
     let tables_to_export = if let Some(table_name) = table {
         vec![table_name]
     } else {
-        vec![
-            "packages".to_string(),
-            "versions".to_string(),
-            "users".to_string(),
-            "vulnerabilities".to_string(),
-            "timeline_events".to_string(),
-        ]
+        TABLES.iter().map(|t| t.to_string()).collect()
     };
 
     for table_name in tables_to_export {
@@ -255,9 +287,18 @@ async fn export_database(config: &Config, output_dir: PathBuf, table: Option<Str
             }
             "vulnerabilities" => export_table("vulnerabilities", db.get_all_vulnerabilities()?, &output_path)?,
             "timeline_events" => export_table("timeline events", db.get_all_timeline_events()?, &output_path)?,
+            "analyses" => export_table("analyses", db.get_all_analyses()?, &output_path)?,
+            // Only hashes of the secrets are stored, so this file cannot be
+            // used to authenticate; it lets a restored server accept the keys
+            // its collectors and workers already hold.
+            "api_keys" => export_table("API keys", db.get_all_api_keys()?, &output_path)?,
             _ => {
                 eprintln!("Error: Unknown table '{}'", table_name);
-                return Err(anyhow::anyhow!("Unknown table: {}", table_name));
+                return Err(anyhow::anyhow!(
+                    "Unknown table: {} (expected one of: {})",
+                    table_name,
+                    TABLES.join(", ")
+                ));
             }
         }
     }
@@ -267,8 +308,13 @@ async fn export_database(config: &Config, output_dir: PathBuf, table: Option<Str
 }
 
 async fn import_database(config: &Config, input: PathBuf, merge: bool) -> Result<()> {
-    let db = Database::new(&config.database_path)?;
+    let db = open_offline(config)?;
+    import_file(&db, &input, merge, true).await
+}
 
+/// Import one exported table. `confirm` gives the operator a few seconds to
+/// cancel before a non-merge import overwrites rows.
+async fn import_file(db: &Database, input: &Path, merge: bool, confirm: bool) -> Result<()> {
     let table_name = input
         .file_stem()
         .and_then(|s| s.to_str())
@@ -277,7 +323,7 @@ async fn import_database(config: &Config, input: PathBuf, merge: bool) -> Result
     info!("Importing {} (merge: {})...", table_name, merge);
     eprintln!("Reading from: {}", input.display());
 
-    let json = std::fs::read_to_string(&input)?;
+    let json = std::fs::read_to_string(input)?;
 
     // Rows keep the primary keys they were exported with. Existing rows with
     // the same key are skipped under `--merge` and overwritten otherwise.
@@ -286,7 +332,7 @@ async fn import_database(config: &Config, input: PathBuf, merge: bool) -> Result
             let data = $data;
             eprintln!("Found {} {} to import", data.len(), $type_name);
 
-            if !merge {
+            if !merge && confirm {
                 eprintln!("WARNING: This will replace existing {}!", $type_name);
                 eprintln!("Press Ctrl+C within 5 seconds to cancel...");
                 tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
@@ -332,12 +378,107 @@ async fn import_database(config: &Config, input: PathBuf, merge: bool) -> Result
             let data: Vec<TimelineEvent> = serde_json::from_str(&json)?;
             import_rows!(data, "timeline events", |e: &TimelineEvent| e.id);
         }
+        "analyses" => {
+            let data: Vec<WorkerAnalysis> = serde_json::from_str(&json)?;
+            import_rows!(data, "analyses", |a: &WorkerAnalysis| a.id);
+        }
+        "api_keys" => {
+            let data: Vec<ApiKey> = serde_json::from_str(&json)?;
+            import_rows!(data, "API keys", |k: &ApiKey| k.key_id.clone());
+        }
         _ => {
             eprintln!("Error: Unknown table '{}'", table_name);
-            return Err(anyhow::anyhow!("Unknown table: {}", table_name));
+            return Err(anyhow::anyhow!(
+                "Unknown table: {} (expected one of: {})",
+                table_name,
+                TABLES.join(", ")
+            ));
         }
     }
 
     eprintln!("\nImport completed successfully!");
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Utc;
+
+    fn open(dir: &tempfile::TempDir, name: &str) -> Database {
+        Database::new(dir.path().join(name).to_str().unwrap()).unwrap()
+    }
+
+    /// Restore a full export into an empty database the way an operator
+    /// would: one `import` per exported file.
+    async fn round_trip(source: &Database, dir: &tempfile::TempDir) -> Database {
+        let out = dir.path().join("export");
+        export_tables(source, &out, None).unwrap();
+
+        let target = open(dir, "restored.db");
+        for table in TABLES {
+            import_file(&target, &out.join(format!("{table}.json")), false, false)
+                .await
+                .unwrap();
+        }
+        target
+    }
+
+    #[tokio::test]
+    async fn export_and_import_round_trip_analyses_and_api_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = open(&dir, "source.db");
+
+        let analysis = source
+            .insert_worker_analysis(WorkerAnalysis {
+                inner: fossdb::WorkerAnalysis {
+                    id: 0,
+                    package_id: 7,
+                    version_id: 11,
+                    analyzed_at: Utc::now(),
+                    findings: vec![fossdb::AnalysisFinding {
+                        kind: fossdb::FindingKind::LicenseDetected,
+                        severity: fossdb::FindingSeverity::Info,
+                        description: "License file detected: MIT".to_string(),
+                        location: Some("LICENSE".to_string()),
+                    }],
+                    checksum_verified: Some(true),
+                    detected_license: Some("MIT".to_string()),
+                },
+            })
+            .unwrap();
+        source
+            .insert_api_key(ApiKey {
+                inner: fossdb::ApiKey {
+                    key_id: "ts55a04c".to_string(),
+                    role: fossdb::ApiKeyRole::Collector,
+                    secret_hash: "ab".repeat(32),
+                    label: Some("host".to_string()),
+                    created_at: Utc::now(),
+                    revoked_at: None,
+                },
+            })
+            .unwrap();
+
+        let restored = round_trip(&source, &dir).await;
+
+        let analyses = restored.get_analyses_by_version(11).unwrap();
+        assert_eq!(analyses.len(), 1);
+        assert_eq!(analyses[0].inner, analysis.inner);
+
+        let key = restored.get_api_key("ts55a04c").unwrap().expect("key restored");
+        assert_eq!(key.secret_hash, "ab".repeat(32));
+        assert_eq!(key.role, fossdb::ApiKeyRole::Collector);
+    }
+
+    #[test]
+    fn unknown_table_names_the_valid_ones() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(&dir, "db");
+
+        let err = export_tables(&db, &dir.path().join("out"), Some("analysis".to_string()))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("analyses"), "{err}");
+    }
 }
