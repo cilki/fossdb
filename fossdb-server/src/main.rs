@@ -220,12 +220,17 @@ async fn start_server(config: Config) -> Result<()> {
 /// points `DATABASE_PATH` into `./data/`, which a fresh checkout lacks, so
 /// create the directory rather than refuse to start.
 fn open_for_serving(path: &str) -> Result<Database> {
+    create_database_dir(path)?;
+    Database::new(path).with_context(|| format!("opening database at {path}"))
+}
+
+fn create_database_dir(path: &str) -> Result<()> {
     if let Some(dir) = Path::new(path).parent().filter(|d| !d.as_os_str().is_empty()) {
         std::fs::create_dir_all(dir).with_context(|| {
             format!("creating {} for DATABASE_PATH={}", dir.display(), path)
         })?;
     }
-    Database::new(path).with_context(|| format!("opening database at {path}"))
+    Ok(())
 }
 
 fn export_table<T: Serialize>(table_name: &str, data: Vec<T>, output_path: &Path) -> Result<()> {
@@ -260,18 +265,42 @@ const TABLES: &[&str] = &[
 /// redb takes an exclusive lock, so this fails while the server is running.
 /// The raw error ("Database already open. Cannot acquire lock.") does not say
 /// which process holds it, so say so here.
-fn open_offline(config: &Config) -> Result<Database> {
-    Database::new(&config.database_path).with_context(|| {
+fn open_offline(path: &str) -> Result<Database> {
+    Database::new(path).with_context(|| {
         format!(
-            "opening {}; if fossdb-server is running against it, stop it first \
-             (the database is locked while it is open)",
-            config.database_path
+            "opening {path}; if fossdb-server is running against it, stop it first \
+             (the database is locked while it is open)"
         )
     })
 }
 
+/// Open an existing database to export from.
+///
+/// redb creates a missing file, so a mistyped `DATABASE_PATH` used to leave a
+/// fresh empty database behind and write a full set of empty backup files
+/// under "Export completed successfully!".
+fn open_for_export(path: &str) -> Result<Database> {
+    if !Path::new(path).exists() {
+        anyhow::bail!(
+            "no database at {path}; set DATABASE_PATH to the file fossdb-server runs against"
+        );
+    }
+    open_offline(path)
+}
+
+/// Open (creating if need be) the database to import into.
+///
+/// Restoring onto a fresh host is the point of `import`, and there the
+/// database directory does not exist yet; redb's error for that names no path
+/// and the lock hint in [`open_offline`] would send the operator looking for
+/// a server that is not running.
+fn open_for_import(path: &str) -> Result<Database> {
+    create_database_dir(path)?;
+    open_offline(path)
+}
+
 async fn export_database(config: &Config, output_dir: PathBuf, table: Option<String>) -> Result<()> {
-    let db = open_offline(config)?;
+    let db = open_for_export(&config.database_path)?;
     export_tables(&db, &output_dir, table)
 }
 
@@ -323,7 +352,7 @@ fn export_tables(db: &Database, output_dir: &Path, table: Option<String>) -> Res
 }
 
 async fn import_database(config: &Config, input: PathBuf, merge: bool) -> Result<()> {
-    let db = open_offline(config)?;
+    let db = open_for_import(&config.database_path)?;
     import_file(&db, &input, merge, true).await
 }
 
@@ -505,6 +534,35 @@ mod tests {
 
         let err = format!("{:#}", open_for_serving(path.to_str().unwrap()).err().unwrap());
         assert!(err.contains(path.to_str().unwrap()), "{err}");
+    }
+
+    #[test]
+    fn export_refuses_a_missing_database_instead_of_creating_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fosdb.db");
+
+        let err = format!("{:#}", open_for_export(path.to_str().unwrap()).err().unwrap());
+        assert!(err.contains(path.to_str().unwrap()), "{err}");
+        assert!(err.contains("DATABASE_PATH"), "{err}");
+        assert!(!path.exists(), "export must not leave an empty database behind");
+    }
+
+    #[test]
+    fn export_opens_an_existing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fossdb.db");
+        drop(open(&dir, "fossdb.db"));
+
+        open_for_export(path.to_str().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn import_creates_a_missing_database_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data").join("fossdb.db");
+
+        open_for_import(path.to_str().unwrap()).unwrap();
+        assert!(path.exists());
     }
 
     #[test]
