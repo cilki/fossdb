@@ -66,7 +66,7 @@ async fn main() -> Result<()> {
 }
 
 async fn start_server(config: Config) -> Result<()> {
-    let db = Database::new(&config.database_path)?;
+    let db = open_for_serving(&config.database_path)?;
     // Refuse to start on a pre-rewrite database rather than failing later
     // with an opaque decode error from inside a request handler.
     db.preflight()?;
@@ -211,6 +211,21 @@ async fn start_server(config: Config) -> Result<()> {
     info!("Public base URL for feed links: {}", config.public_base_url);
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// Open (creating if need be) the database the server runs against.
+///
+/// redb creates the file but not its directory, and its error for a missing
+/// one ("I/O error: No such file or directory") names neither. `.env.example`
+/// points `DATABASE_PATH` into `./data/`, which a fresh checkout lacks, so
+/// create the directory rather than refuse to start.
+fn open_for_serving(path: &str) -> Result<Database> {
+    if let Some(dir) = Path::new(path).parent().filter(|d| !d.as_os_str().is_empty()) {
+        std::fs::create_dir_all(dir).with_context(|| {
+            format!("creating {} for DATABASE_PATH={}", dir.display(), path)
+        })?;
+    }
+    Database::new(path).with_context(|| format!("opening database at {path}"))
 }
 
 fn export_table<T: Serialize>(table_name: &str, data: Vec<T>, output_path: &Path) -> Result<()> {
@@ -469,6 +484,27 @@ mod tests {
         let key = restored.get_api_key("ts55a04c").unwrap().expect("key restored");
         assert_eq!(key.secret_hash, "ab".repeat(32));
         assert_eq!(key.role, fossdb::ApiKeyRole::Collector);
+    }
+
+    #[test]
+    fn serving_creates_a_missing_database_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data").join("nested").join("fossdb.db");
+
+        open_for_serving(path.to_str().unwrap()).unwrap();
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn serving_names_the_path_it_cannot_use() {
+        let dir = tempfile::tempdir().unwrap();
+        // A regular file where the database directory should be.
+        let blocker = dir.path().join("data");
+        std::fs::write(&blocker, "").unwrap();
+        let path = blocker.join("fossdb.db");
+
+        let err = format!("{:#}", open_for_serving(path.to_str().unwrap()).err().unwrap());
+        assert!(err.contains(path.to_str().unwrap()), "{err}");
     }
 
     #[test]
