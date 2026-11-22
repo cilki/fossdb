@@ -27,70 +27,36 @@ const MAX_DEPTH: usize = 256;
 
 #[derive(Default, Clone)]
 struct RegisterState {
-    rax: u64,
-    rbx: u64,
-    rcx: u64,
-    rdx: u64,
-    rsi: u64,
-    rdi: u64,
-    rbp: u64,
-    rsp: u64,
-    r8: u64,
-    r9: u64,
-    r10: u64,
-    r11: u64,
-    r12: u64,
-    r13: u64,
-    r14: u64,
-    r15: u64,
+    /// The 16 general-purpose registers, in iced's RAX..=R15 order.
+    gprs: [u64; 16],
     /// Current instruction pointer (absolute virtual address).
     rip: u64,
     stack: Vec<u64>,
 }
 
 impl RegisterState {
+    /// Slot in `gprs` backing `register`, whatever its width. The legacy high
+    /// byte registers (AH..BH) and anything that is not a GPR are untracked.
+    fn slot(register: Register) -> Option<usize> {
+        if matches!(
+            register,
+            Register::AH | Register::CH | Register::DH | Register::BH
+        ) {
+            return None;
+        }
+        (register.full_register() as usize)
+            .checked_sub(Register::RAX as usize)
+            .filter(|&i| i < 16)
+    }
+
     fn set(&mut self, register: Register, value: u64) {
-        match register {
-            Register::RAX | Register::EAX | Register::AX | Register::AL => self.rax = value,
-            Register::RBX | Register::EBX | Register::BX | Register::BL => self.rbx = value,
-            Register::RCX | Register::ECX | Register::CX | Register::CL => self.rcx = value,
-            Register::RDX | Register::EDX | Register::DX | Register::DL => self.rdx = value,
-            Register::RSI | Register::ESI | Register::SI | Register::SIL => self.rsi = value,
-            Register::RDI | Register::EDI | Register::DI | Register::DIL => self.rdi = value,
-            Register::RBP | Register::EBP | Register::BP | Register::BPL => self.rbp = value,
-            Register::RSP | Register::ESP | Register::SP | Register::SPL => self.rsp = value,
-            Register::R8 | Register::R8D | Register::R8W | Register::R8L => self.r8 = value,
-            Register::R9 | Register::R9D | Register::R9W | Register::R9L => self.r9 = value,
-            Register::R10 | Register::R10D | Register::R10W | Register::R10L => self.r10 = value,
-            Register::R11 | Register::R11D | Register::R11W | Register::R11L => self.r11 = value,
-            Register::R12 | Register::R12D | Register::R12W | Register::R12L => self.r12 = value,
-            Register::R13 | Register::R13D | Register::R13W | Register::R13L => self.r13 = value,
-            Register::R14 | Register::R14D | Register::R14W | Register::R14L => self.r14 = value,
-            Register::R15 | Register::R15D | Register::R15W | Register::R15L => self.r15 = value,
-            _ => {}
+        if let Some(i) = Self::slot(register) {
+            self.gprs[i] = value;
         }
     }
 
     fn get(&self, register: Register) -> u64 {
-        match register {
-            Register::RAX | Register::EAX | Register::AX | Register::AL => self.rax,
-            Register::RBX | Register::EBX | Register::BX | Register::BL => self.rbx,
-            Register::RCX | Register::ECX | Register::CX | Register::CL => self.rcx,
-            Register::RDX | Register::EDX | Register::DX | Register::DL => self.rdx,
-            Register::RSI | Register::ESI | Register::SI | Register::SIL => self.rsi,
-            Register::RDI | Register::EDI | Register::DI | Register::DIL => self.rdi,
-            Register::RBP | Register::EBP | Register::BP | Register::BPL => self.rbp,
-            Register::RSP | Register::ESP | Register::SP | Register::SPL => self.rsp,
-            Register::R8 | Register::R8D | Register::R8W | Register::R8L => self.r8,
-            Register::R9 | Register::R9D | Register::R9W | Register::R9L => self.r9,
-            Register::R10 | Register::R10D | Register::R10W | Register::R10L => self.r10,
-            Register::R11 | Register::R11D | Register::R11W | Register::R11L => self.r11,
-            Register::R12 | Register::R12D | Register::R12W | Register::R12L => self.r12,
-            Register::R13 | Register::R13D | Register::R13W | Register::R13L => self.r13,
-            Register::R14 | Register::R14D | Register::R14W | Register::R14L => self.r14,
-            Register::R15 | Register::R15D | Register::R15W | Register::R15L => self.r15,
-            _ => 0,
-        }
+        Self::slot(register).map_or(0, |i| self.gprs[i])
     }
 }
 
@@ -143,8 +109,7 @@ impl Program {
             let bytes = match std::fs::read(&p) {
                 Ok(b) => b,
                 Err(e) => {
-                    prog.missing_modules
-                        .push(format!("{}: {}", p.display(), e));
+                    prog.missing_modules.push(format!("{}: {}", p.display(), e));
                     continue;
                 }
             };
@@ -177,7 +142,7 @@ impl Program {
             if is_main {
                 prog.entry = elf.entry.wrapping_add(base);
             }
-            prog.load_module(&elf, &bytes, base, &p);
+            prog.load_module(&elf, &bytes, base);
             prog.modules.push(format!("{} @ 0x{:x}", p.display(), base));
 
             // Queue dependencies. Resolve via ldd if it can run, falling back to
@@ -195,7 +160,7 @@ impl Program {
         Ok(prog)
     }
 
-    fn load_module(&mut self, elf: &goblin::elf::Elf, bytes: &[u8], base: u64, path: &Path) {
+    fn load_module(&mut self, elf: &goblin::elf::Elf, bytes: &[u8], base: u64) {
         // Decode every executable PROGBITS section.
         for sh in &elf.section_headers {
             if sh.sh_type != goblin::elf::section_header::SHT_PROGBITS {
@@ -210,26 +175,16 @@ impl Program {
                 Some(e) if e <= bytes.len() => e,
                 _ => continue,
             };
-            let code = &bytes[start..end];
-            let va = sh.sh_addr.wrapping_add(base);
-            let mut decoder = Decoder::with_ip(64, code, va, DecoderOptions::NONE);
-            let mut ins = Instruction::default();
-            while decoder.can_decode() {
-                decoder.decode_out(&mut ins);
-                if !ins.is_invalid() {
-                    self.instructions.insert(ins.ip(), ins);
-                }
-            }
+            self.decode(&bytes[start..end], sh.sh_addr.wrapping_add(base));
         }
 
         // Map GOT slots to imported symbol names.
-        for reloc in elf.pltrelocs.iter() {
-            self.record_got_reloc(elf, base, reloc.r_type, reloc.r_sym, reloc.r_offset);
-        }
-        for reloc in elf.dynrelas.iter() {
-            self.record_got_reloc(elf, base, reloc.r_type, reloc.r_sym, reloc.r_offset);
-        }
-        for reloc in elf.dynrels.iter() {
+        for reloc in elf
+            .pltrelocs
+            .iter()
+            .chain(elf.dynrelas.iter())
+            .chain(elf.dynrels.iter())
+        {
             self.record_got_reloc(elf, base, reloc.r_type, reloc.r_sym, reloc.r_offset);
         }
 
@@ -248,8 +203,18 @@ impl Program {
                 }
             }
         }
+    }
 
-        let _ = path;
+    /// Decode `code`, loaded at virtual address `va`, into `instructions`.
+    fn decode(&mut self, code: &[u8], va: u64) {
+        let mut decoder = Decoder::with_ip(64, code, va, DecoderOptions::NONE);
+        let mut ins = Instruction::default();
+        while decoder.can_decode() {
+            decoder.decode_out(&mut ins);
+            if !ins.is_invalid() {
+                self.instructions.insert(ins.ip(), ins);
+            }
+        }
     }
 
     fn record_got_reloc(
@@ -303,230 +268,187 @@ pub fn extract_syscalls_program(path: &Path) -> Result<Vec<DiscoveredSyscall>> {
 }
 
 fn run(prog: &Program) -> Vec<DiscoveredSyscall> {
-    let mut state = RegisterState::default();
-    state.rip = prog.entry;
-    let mut syscalls: Vec<DiscoveredSyscall> = Vec::new();
-    let mut steps: usize = 0;
-    let mut forks: usize = 0;
-    emulate(
-        &mut state,
-        prog,
-        &mut HashSet::new(),
-        &mut syscalls,
-        &mut steps,
-        &mut forks,
-        0,
-    );
-    syscalls
+    let mut state = RegisterState {
+        rip: prog.entry,
+        ..Default::default()
+    };
+    let mut walk = Walk::new(prog);
+    walk.emulate(&mut state, &mut HashSet::new(), 0);
+    walk.syscalls
 }
 
-fn emulate(
-    state: &mut RegisterState,
-    prog: &Program,
-    visited: &mut HashSet<u64>,
-    syscalls: &mut Vec<DiscoveredSyscall>,
-    steps: &mut usize,
-    forks: &mut usize,
-    depth: usize,
-) {
-    if depth >= MAX_DEPTH {
-        return;
+/// One analysis run: the program being walked, the syscalls found so far, and
+/// the step and fork budgets that every fork draws from.
+struct Walk<'a> {
+    prog: &'a Program,
+    syscalls: Vec<DiscoveredSyscall>,
+    steps: usize,
+    forks: usize,
+}
+
+impl<'a> Walk<'a> {
+    fn new(prog: &'a Program) -> Self {
+        Walk {
+            prog,
+            syscalls: Vec::new(),
+            steps: 0,
+            forks: 0,
+        }
     }
-    loop {
-        if *steps >= MAX_STEPS {
+
+    /// Explore `target` on copies of `state` and `visited`, unless the fork
+    /// budget is spent.
+    fn fork(&mut self, state: &RegisterState, visited: &HashSet<u64>, target: u64, depth: usize) {
+        if self.forks >= MAX_FORKS {
             return;
         }
-        *steps += 1;
+        self.forks += 1;
+        let mut forked = state.clone();
+        forked.rip = target;
+        self.emulate(&mut forked, &mut visited.clone(), depth + 1);
+    }
 
-        if !visited.insert(state.rip) {
+    fn emulate(&mut self, state: &mut RegisterState, visited: &mut HashSet<u64>, depth: usize) {
+        if depth >= MAX_DEPTH {
             return;
         }
+        loop {
+            if self.steps >= MAX_STEPS {
+                return;
+            }
+            self.steps += 1;
 
-        let ins = match prog.instructions.get(&state.rip) {
-            Some(i) => *i,
-            None => return,
-        };
-        state.rip = ins.next_ip();
+            if !visited.insert(state.rip) {
+                return;
+            }
 
-        match ins.mnemonic() {
-            Mnemonic::Mov => match (ins.op_kind(0), ins.op_kind(1)) {
-                (OpKind::Register, OpKind::Register) => {
-                    let v = state.get(ins.op_register(1));
-                    state.set(ins.op_register(0), v);
-                }
-                (OpKind::Register, k) if is_immediate(k) => {
-                    state.set(ins.op_register(0), ins.immediate(1));
-                }
-                _ => {}
-            },
-            Mnemonic::Lea => {
-                if ins.op_kind(0) == OpKind::Register && ins.is_ip_rel_memory_operand() {
-                    state.set(ins.op_register(0), ins.ip_rel_memory_address());
-                }
-            }
-            Mnemonic::Add => match (ins.op_kind(0), ins.op_kind(1)) {
-                (OpKind::Register, OpKind::Register) => {
-                    let v = state
-                        .get(ins.op_register(0))
-                        .wrapping_add(state.get(ins.op_register(1)));
-                    state.set(ins.op_register(0), v);
-                }
-                (OpKind::Register, k) if is_immediate(k) => {
-                    let v = state.get(ins.op_register(0)).wrapping_add(ins.immediate(1));
-                    state.set(ins.op_register(0), v);
-                }
-                _ => {}
-            },
-            Mnemonic::Sub => match (ins.op_kind(0), ins.op_kind(1)) {
-                (OpKind::Register, OpKind::Register) => {
-                    let v = state
-                        .get(ins.op_register(0))
-                        .wrapping_sub(state.get(ins.op_register(1)));
-                    state.set(ins.op_register(0), v);
-                }
-                (OpKind::Register, k) if is_immediate(k) => {
-                    let v = state.get(ins.op_register(0)).wrapping_sub(ins.immediate(1));
-                    state.set(ins.op_register(0), v);
-                }
-                _ => {}
-            },
-            Mnemonic::And => match (ins.op_kind(0), ins.op_kind(1)) {
-                (OpKind::Register, OpKind::Register) => {
-                    let v = state.get(ins.op_register(0)) & state.get(ins.op_register(1));
-                    state.set(ins.op_register(0), v);
-                }
-                (OpKind::Register, k) if is_immediate(k) => {
-                    let v = state.get(ins.op_register(0)) & ins.immediate(1);
-                    state.set(ins.op_register(0), v);
-                }
-                _ => {}
-            },
-            Mnemonic::Or => match (ins.op_kind(0), ins.op_kind(1)) {
-                (OpKind::Register, OpKind::Register) => {
-                    let v = state.get(ins.op_register(0)) | state.get(ins.op_register(1));
-                    state.set(ins.op_register(0), v);
-                }
-                (OpKind::Register, k) if is_immediate(k) => {
-                    let v = state.get(ins.op_register(0)) | ins.immediate(1);
-                    state.set(ins.op_register(0), v);
-                }
-                _ => {}
-            },
-            Mnemonic::Xor => match (ins.op_kind(0), ins.op_kind(1)) {
-                (OpKind::Register, OpKind::Register) => {
-                    let v = state.get(ins.op_register(0)) ^ state.get(ins.op_register(1));
-                    state.set(ins.op_register(0), v);
-                }
-                (OpKind::Register, k) if is_immediate(k) => {
-                    let v = state.get(ins.op_register(0)) ^ ins.immediate(1);
-                    state.set(ins.op_register(0), v);
-                }
-                _ => {}
-            },
-            Mnemonic::Not => {
-                if ins.op_kind(0) == OpKind::Register {
-                    let v = !state.get(ins.op_register(0));
-                    state.set(ins.op_register(0), v);
-                }
-            }
-            Mnemonic::Push => {
-                if ins.op_kind(0) == OpKind::Register {
-                    state.stack.push(state.get(ins.op_register(0)));
-                } else if is_immediate(ins.op_kind(0)) {
-                    state.stack.push(ins.immediate(0));
-                }
-            }
-            Mnemonic::Pop => {
-                let v = state.stack.pop().unwrap_or(0);
-                if ins.op_kind(0) == OpKind::Register {
-                    state.set(ins.op_register(0), v);
-                }
-            }
-            Mnemonic::Jmp => match prog.resolve_target(&ins) {
-                Some(target) => state.rip = target,
+            let ins = match self.prog.instructions.get(&state.rip) {
+                Some(i) => *i,
                 None => return,
-            },
-            Mnemonic::Je
-            | Mnemonic::Jne
-            | Mnemonic::Jl
-            | Mnemonic::Jg
-            | Mnemonic::Jle
-            | Mnemonic::Jge
-            | Mnemonic::Ja
-            | Mnemonic::Jae
-            | Mnemonic::Jb
-            | Mnemonic::Jbe
-            | Mnemonic::Js
-            | Mnemonic::Jns
-            | Mnemonic::Jp
-            | Mnemonic::Jnp
-            | Mnemonic::Jcxz
-            | Mnemonic::Jecxz
-            | Mnemonic::Jrcxz
-            | Mnemonic::Loop
-            | Mnemonic::Loope
-            | Mnemonic::Loopne => {
-                if let Some(target) = prog.resolve_target(&ins) {
-                    if *forks < MAX_FORKS {
-                        *forks += 1;
-                        let mut forked = state.clone();
-                        forked.rip = target;
-                        emulate(
-                            &mut forked,
-                            prog,
-                            &mut visited.clone(),
-                            syscalls,
-                            steps,
-                            forks,
-                            depth + 1,
-                        );
+            };
+            state.rip = ins.next_ip();
+
+            match ins.mnemonic() {
+                m @ (Mnemonic::Mov
+                | Mnemonic::Add
+                | Mnemonic::Sub
+                | Mnemonic::And
+                | Mnemonic::Or
+                | Mnemonic::Xor) => {
+                    if ins.op_kind(0) != OpKind::Register {
+                        continue;
+                    }
+                    let Some(src) = operand(&ins, 1, state) else {
+                        continue;
+                    };
+                    let dst = ins.op_register(0);
+                    let cur = state.get(dst);
+                    let value = match m {
+                        Mnemonic::Add => cur.wrapping_add(src),
+                        Mnemonic::Sub => cur.wrapping_sub(src),
+                        Mnemonic::And => cur & src,
+                        Mnemonic::Or => cur | src,
+                        Mnemonic::Xor => cur ^ src,
+                        _ => src,
+                    };
+                    state.set(dst, value);
+                }
+                Mnemonic::Lea => {
+                    if ins.op_kind(0) == OpKind::Register && ins.is_ip_rel_memory_operand() {
+                        state.set(ins.op_register(0), ins.ip_rel_memory_address());
                     }
                 }
-                // Fall through with the current thread.
-            }
-            Mnemonic::Call => {
-                state.stack.push(ins.next_ip());
-                if let Some(target) = prog.resolve_target(&ins) {
-                    if prog.instructions.contains_key(&target) && *forks < MAX_FORKS {
-                        *forks += 1;
-                        let mut forked = state.clone();
-                        forked.rip = target;
-                        emulate(
-                            &mut forked,
-                            prog,
-                            &mut visited.clone(),
-                            syscalls,
-                            steps,
-                            forks,
-                            depth + 1,
-                        );
+                Mnemonic::Not => {
+                    if ins.op_kind(0) == OpKind::Register {
+                        let v = !state.get(ins.op_register(0));
+                        state.set(ins.op_register(0), v);
                     }
                 }
-                let _ = state.stack.pop();
-            }
-            Mnemonic::Ret => return,
-            Mnemonic::Syscall => {
-                let number = state.rax;
-                syscalls.push(DiscoveredSyscall {
-                    address: ins.ip(),
-                    number,
-                    name: syscall_name(number),
-                    args: [
-                        state.rdi, state.rsi, state.rdx, state.r10, state.r8, state.r9,
-                    ],
-                });
-            }
-            Mnemonic::Test
-            | Mnemonic::Cmp
-            | Mnemonic::Nop
-            | Mnemonic::Endbr64
-            | Mnemonic::Endbr32 => {}
-            Mnemonic::Hlt | Mnemonic::Ud2 => return,
-            _ => {
-                // Unmodeled instruction: register state may now be stale, but
-                // we keep walking the control flow rather than aborting.
+                Mnemonic::Push => {
+                    if let Some(v) = operand(&ins, 0, state) {
+                        state.stack.push(v);
+                    }
+                }
+                Mnemonic::Pop => {
+                    let v = state.stack.pop().unwrap_or(0);
+                    if ins.op_kind(0) == OpKind::Register {
+                        state.set(ins.op_register(0), v);
+                    }
+                }
+                Mnemonic::Jmp => match self.prog.resolve_target(&ins) {
+                    Some(target) => state.rip = target,
+                    None => return,
+                },
+                Mnemonic::Je
+                | Mnemonic::Jne
+                | Mnemonic::Jl
+                | Mnemonic::Jg
+                | Mnemonic::Jle
+                | Mnemonic::Jge
+                | Mnemonic::Ja
+                | Mnemonic::Jae
+                | Mnemonic::Jb
+                | Mnemonic::Jbe
+                | Mnemonic::Js
+                | Mnemonic::Jns
+                | Mnemonic::Jp
+                | Mnemonic::Jnp
+                | Mnemonic::Jcxz
+                | Mnemonic::Jecxz
+                | Mnemonic::Jrcxz
+                | Mnemonic::Loop
+                | Mnemonic::Loope
+                | Mnemonic::Loopne => {
+                    if let Some(target) = self.prog.resolve_target(&ins) {
+                        self.fork(state, visited, target, depth);
+                    }
+                    // Fall through with the current thread.
+                }
+                Mnemonic::Call => {
+                    state.stack.push(ins.next_ip());
+                    if let Some(target) = self.prog.resolve_target(&ins) {
+                        if self.prog.instructions.contains_key(&target) {
+                            self.fork(state, visited, target, depth);
+                        }
+                    }
+                    let _ = state.stack.pop();
+                }
+                Mnemonic::Ret | Mnemonic::Hlt | Mnemonic::Ud2 => return,
+                Mnemonic::Syscall => {
+                    let number = state.get(Register::RAX);
+                    let args = [
+                        Register::RDI,
+                        Register::RSI,
+                        Register::RDX,
+                        Register::R10,
+                        Register::R8,
+                        Register::R9,
+                    ]
+                    .map(|r| state.get(r));
+                    self.syscalls.push(DiscoveredSyscall {
+                        address: ins.ip(),
+                        number,
+                        name: syscall_name(number),
+                        args,
+                    });
+                }
+                _ => {
+                    // Unmodeled instruction (or one with no effect on the
+                    // tracked state, like cmp/test/nop): register state may
+                    // now be stale, but we keep walking the control flow
+                    // rather than aborting.
+                }
             }
         }
+    }
+}
+
+/// Value of operand `n` if it is a register or an immediate.
+fn operand(ins: &Instruction, n: u32, state: &RegisterState) -> Option<u64> {
+    match ins.op_kind(n) {
+        OpKind::Register => Some(state.get(ins.op_register(n))),
+        k if is_immediate(k) => Some(ins.immediate(n)),
+        _ => None,
     }
 }
 
@@ -547,11 +469,7 @@ fn is_immediate(kind: OpKind) -> bool {
 /// Resolve the on-disk paths of a binary's dependencies. Tries `ldd` first
 /// (which honors ld.so.cache, RPATH, LD_LIBRARY_PATH), then falls back to
 /// scanning standard library directories using DT_NEEDED soname matches.
-fn resolve_libraries(
-    binary: &Path,
-    needed: &[String],
-    missing: &mut Vec<String>,
-) -> Vec<PathBuf> {
+fn resolve_libraries(binary: &Path, needed: &[String], missing: &mut Vec<String>) -> Vec<PathBuf> {
     let mut found: Vec<PathBuf> = Vec::new();
     let mut found_names: HashSet<String> = HashSet::new();
 
@@ -721,7 +639,10 @@ fn syscall_name(n: u64) -> &'static str {
 }
 
 /// Convert discovered syscalls into analysis findings.
-pub fn syscalls_to_findings(syscalls: &[DiscoveredSyscall], location: &str) -> Vec<AnalysisFinding> {
+pub fn syscalls_to_findings(
+    syscalls: &[DiscoveredSyscall],
+    location: &str,
+) -> Vec<AnalysisFinding> {
     let mut seen: HashMap<u64, &DiscoveredSyscall> = HashMap::new();
     for sc in syscalls {
         seen.entry(sc.number).or_insert(sc);
@@ -786,29 +707,11 @@ mod tests {
     fn run_assembled(mut a: CodeAssembler, state: &mut RegisterState) -> Vec<DiscoveredSyscall> {
         let bytes = a.assemble(0x1000).unwrap();
         let mut prog = Program::default();
-        let mut decoder = Decoder::with_ip(64, &bytes, 0x1000, DecoderOptions::NONE);
-        let mut ins = Instruction::default();
-        while decoder.can_decode() {
-            decoder.decode_out(&mut ins);
-            if !ins.is_invalid() {
-                prog.instructions.insert(ins.ip(), ins);
-            }
-        }
-        prog.entry = 0x1000;
+        prog.decode(&bytes, 0x1000);
         state.rip = 0x1000;
-        let mut syscalls = Vec::new();
-        let mut steps = 0;
-        let mut forks = 0;
-        emulate(
-            state,
-            &prog,
-            &mut HashSet::new(),
-            &mut syscalls,
-            &mut steps,
-            &mut forks,
-            0,
-        );
-        syscalls
+        let mut walk = Walk::new(&prog);
+        walk.emulate(state, &mut HashSet::new(), 0);
+        walk.syscalls
     }
 
     #[test]
@@ -817,11 +720,34 @@ mod tests {
         a.mov(rax, rbx).unwrap();
         a.mov(rbx, 0x100u64).unwrap();
         let mut state = RegisterState::default();
-        state.rax = 0x1337;
-        state.rbx = 0x890;
+        state.set(Register::RAX, 0x1337);
+        state.set(Register::RBX, 0x890);
         run_assembled(a, &mut state);
-        assert_eq!(state.rax, 0x890);
-        assert_eq!(state.rbx, 0x100);
+        assert_eq!(state.get(Register::RAX), 0x890);
+        assert_eq!(state.get(Register::RBX), 0x100);
+    }
+
+    #[test]
+    fn alu_ops_on_partial_registers_track_the_full_register() {
+        let mut a = CodeAssembler::new(64).unwrap();
+        a.mov(eax, 0x40u32).unwrap();
+        a.add(rax, 0x0fi32).unwrap();
+        a.sub(eax, 0x02u32).unwrap();
+        a.and(rax, 0x3fi32).unwrap(); // 0x0d
+        a.mov(rcx, 0x30u64).unwrap();
+        a.or(rax, rcx).unwrap(); // 0x3d
+        a.xor(edi, edi).unwrap();
+        a.push(rax).unwrap();
+        a.pop(rsi).unwrap();
+        a.syscall().unwrap();
+        let mut state = RegisterState::default();
+        state.set(Register::RDI, 0xdead);
+        let syscalls = run_assembled(a, &mut state);
+        assert_eq!(syscalls.len(), 1);
+        assert_eq!(syscalls[0].number, 61);
+        assert_eq!(syscalls[0].name, "wait4");
+        assert_eq!(syscalls[0].args[0], 0);
+        assert_eq!(syscalls[0].args[1], 61);
     }
 
     #[test]
@@ -948,8 +874,7 @@ mod tests {
         }
 
         // Whole-program static analysis (main + libc + ld + ...).
-        let discovered =
-            extract_syscalls_program(&bin_path).expect("symbolic execution failed");
+        let discovered = extract_syscalls_program(&bin_path).expect("symbolic execution failed");
         let reachable: HashSet<&'static str> = discovered.iter().map(|s| s.name).collect();
         eprintln!(
             "symbolic analysis discovered {} syscall sites, {} unique names",
@@ -973,8 +898,7 @@ mod tests {
         );
 
         let log = std::fs::read_to_string(strace_log.path()).expect("read strace log");
-        let observed: HashSet<String> =
-            log.lines().filter_map(parse_strace_syscall_name).collect();
+        let observed: HashSet<String> = log.lines().filter_map(parse_strace_syscall_name).collect();
         assert!(!observed.is_empty(), "strace produced no syscall lines");
 
         let missing: Vec<&String> = observed
