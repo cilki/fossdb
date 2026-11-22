@@ -1,41 +1,48 @@
 use anyhow::Result;
+use clap::Parser;
 
 mod analysis;
 mod client;
 
 use client::WorkerClient;
 
+/// FossDB package analysis worker
+///
+/// Claims unanalysed package versions from fossdb-server's worker API,
+/// downloads and analyses them, and submits the results.
+///
+/// Every option can also be set in the environment or in a `.env` file. The
+/// API key is read from WORKER_API_KEY, or from the file named by
+/// WORKER_API_KEY_FILE; mint one on the server with
+/// `fossdb admin api-key create --role worker`.
+#[derive(Parser)]
+#[command(version)]
 struct Config {
+    /// Base URL of fossdb-server's worker API
+    #[arg(long, env = "WORKER_SERVER_URL", default_value = "http://localhost:3002")]
     server_url: String,
-    api_key: String,
-    interval_secs: u64,
-}
 
-impl Config {
-    fn from_env() -> Result<Self> {
-        Ok(Self {
-            server_url: std::env::var("WORKER_SERVER_URL")
-                .unwrap_or_else(|_| "http://localhost:3002".to_string()),
-            // Accepts `WORKER_API_KEY` or `WORKER_API_KEY_FILE`; the latter is
-            // what a service manager hands over via systemd credentials.
-            api_key: fossdb::secret_file::from_env("WORKER_API_KEY")?,
-            interval_secs: std::env::var("WORKER_INTERVAL_SECS")
-                .unwrap_or_else(|_| "60".to_string())
-                .parse()
-                .unwrap_or(60),
-        })
-    }
+    /// Seconds to wait before asking again when the queue is empty or a task
+    /// failed
+    #[arg(long, env = "WORKER_INTERVAL_SECS", default_value_t = 60)]
+    interval_secs: u64,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
+    // Before anything else, so `--help` and a malformed setting stop here
+    // rather than after the worker has started claiming tasks.
+    let config = Config::parse();
     tracing_subscriber::fmt::init();
 
-    let config = Config::from_env()?;
-    let client = WorkerClient::new(config.server_url.clone(), config.api_key.clone())?;
+    // Not a flag: a key on the command line would show up in `ps`.
+    // Accepts `WORKER_API_KEY` or `WORKER_API_KEY_FILE`; the latter is what a
+    // service manager hands over via systemd credentials.
+    let api_key = fossdb::secret_file::from_env("WORKER_API_KEY")?;
+    let client = WorkerClient::new(config.server_url.clone(), api_key.clone())?;
 
-    if !fossdb::api_key::is_well_formed(&config.api_key) {
+    if !fossdb::api_key::is_well_formed(&api_key) {
         tracing::warn!(
             "WORKER_API_KEY does not look like a fossdb API key (expected {} characters \
              beginning with {:?}); the server will reject it",
@@ -109,6 +116,18 @@ async fn run_once(client: &WorkerClient) -> Result<Outcome> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Config::command().debug_assert();
+    }
+
+    /// A typo used to fall back silently to 60 seconds.
+    #[test]
+    fn malformed_interval_is_rejected() {
+        assert!(Config::try_parse_from(["fossdb-worker", "--interval-secs", "1m"]).is_err());
+    }
 
     #[test]
     fn asks_again_immediately_after_a_completed_task() {

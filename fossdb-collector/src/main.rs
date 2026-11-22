@@ -1,4 +1,5 @@
 use anyhow::Result;
+use clap::Parser;
 use std::sync::Arc;
 
 mod client;
@@ -7,38 +8,47 @@ mod collectors;
 use client::CollectorClient;
 use collectors::Collector;
 
+/// FossDB package collector
+///
+/// Fetches package metadata and security advisories and submits them to
+/// fossdb-server's collector API, then repeats every `--interval-hours`.
+///
+/// Every option can also be set in the environment or in a `.env` file. The
+/// API key is read from COLLECTOR_API_KEY, or from the file named by
+/// COLLECTOR_API_KEY_FILE; mint one on the server with
+/// `fossdb admin api-key create --role collector`. OSV_ECOSYSTEMS selects the
+/// ecosystems whose advisories are ingested (default: crates.io).
+#[derive(Parser)]
+#[command(version)]
 struct Config {
+    /// Base URL of fossdb-server's collector API
+    #[arg(long, env = "SERVER_INTERNAL_URL", default_value = "http://localhost:3001")]
     server_url: String,
-    api_key: String,
-    interval_hours: u64,
-    #[allow(dead_code)]
-    libraries_io_api_key: Option<String>,
-}
 
-impl Config {
-    fn from_env() -> Result<Self> {
-        Ok(Self {
-            server_url: std::env::var("SERVER_INTERNAL_URL")
-                .unwrap_or_else(|_| "http://localhost:3001".to_string()),
-            // Accepts `COLLECTOR_API_KEY` or `COLLECTOR_API_KEY_FILE`.
-            api_key: fossdb::secret_file::from_env("COLLECTOR_API_KEY")?,
-            interval_hours: std::env::var("COLLECTOR_INTERVAL_HOURS")
-                .unwrap_or_else(|_| "1".to_string())
-                .parse()
-                .unwrap_or(1),
-            libraries_io_api_key: std::env::var("LIBRARIES_IO_API_KEY").ok(),
-        })
-    }
+    /// Hours to wait between runs of each collector
+    #[arg(long, env = "COLLECTOR_INTERVAL_HOURS", default_value_t = 1)]
+    interval_hours: u64,
+
+    /// libraries.io API key; enables the libraries.io collector when built
+    /// with the `collector-libraries-io` feature
+    #[allow(dead_code)]
+    #[arg(long, env = "LIBRARIES_IO_API_KEY", hide_env_values = true)]
+    libraries_io_api_key: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
     dotenvy::dotenv().ok();
+    // Before anything else, so `--help` and a malformed setting stop here
+    // rather than after a collection run has started.
+    let config = Config::parse();
     tracing_subscriber::fmt::init();
 
-    let config = Config::from_env()?;
+    // Not a flag: a key on the command line would show up in `ps`.
+    // Accepts `COLLECTOR_API_KEY` or `COLLECTOR_API_KEY_FILE`.
+    let api_key = fossdb::secret_file::from_env("COLLECTOR_API_KEY")?;
 
-    if !fossdb::api_key::is_well_formed(&config.api_key) {
+    if !fossdb::api_key::is_well_formed(&api_key) {
         tracing::warn!(
             "COLLECTOR_API_KEY does not look like a fossdb API key (expected {} characters \
              beginning with {:?}); the server will reject it",
@@ -47,7 +57,7 @@ async fn main() -> Result<()> {
         );
     }
 
-    let client = Arc::new(CollectorClient::new(config.server_url.clone(), config.api_key.clone())?);
+    let client = Arc::new(CollectorClient::new(config.server_url.clone(), api_key)?);
 
     let mut collector_list: Vec<Arc<dyn Collector>> = vec![];
 
@@ -72,7 +82,8 @@ async fn main() -> Result<()> {
     }
 
     #[cfg(feature = "collector-libraries-io")]
-    if let Some(api_key) = config.libraries_io_api_key {
+    // `.env.example` ships `LIBRARIES_IO_API_KEY=`, which means "no key".
+    if let Some(api_key) = config.libraries_io_api_key.filter(|k| !k.is_empty()) {
         let http = reqwest::Client::builder()
             .user_agent("fossdb-collector")
             .timeout(std::time::Duration::from_secs(30))
@@ -137,5 +148,22 @@ async fn run_collector_loop(
         let duration = tokio::time::Duration::from_secs(interval_hours.saturating_mul(3600));
         tracing::info!("Collector {} sleeping for {} hours", name, interval_hours);
         tokio::time::sleep(duration).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn cli_definition_is_valid() {
+        Config::command().debug_assert();
+    }
+
+    /// A typo used to fall back silently to one hour.
+    #[test]
+    fn malformed_interval_is_rejected() {
+        assert!(Config::try_parse_from(["fossdb-collector", "--interval-hours", "2h"]).is_err());
     }
 }
