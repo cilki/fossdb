@@ -287,45 +287,14 @@ fn analyze_directory(dir: &Path) -> Result<SourceAnalysis> {
 fn detect_license(content: &str) -> Option<&'static str> {
     let upper = content.to_uppercase();
 
-    // Order matters. The Lesser and Affero variants both quote the plain "GNU
-    // General Public License" in their own text, so the specific variants must
-    // be tested before the generic GPL patterns or LGPL/AGPL would be reported
-    // as GPL. Likewise "VERSION 2.1" is checked before "VERSION 2", since the
-    // latter is a substring of the former.
     if upper.contains("MIT LICENSE")
         || upper.contains("PERMISSION IS HEREBY GRANTED, FREE OF CHARGE")
     {
         Some("MIT")
     } else if upper.contains("APACHE LICENSE") && upper.contains("VERSION 2.0") {
         Some("Apache-2.0")
-    } else if upper.contains("GNU AFFERO GENERAL PUBLIC LICENSE") {
-        if upper.contains("VERSION 3") {
-            Some("AGPL-3.0")
-        } else {
-            Some("AGPL-1.0")
-        }
-    } else if upper.contains("GNU LESSER GENERAL PUBLIC LICENSE") {
-        if upper.contains("VERSION 3") {
-            Some("LGPL-3.0")
-        } else if upper.contains("VERSION 2.1") {
-            Some("LGPL-2.1")
-        } else {
-            Some("LGPL-2.0")
-        }
-    } else if upper.contains("GNU LIBRARY GENERAL PUBLIC LICENSE") {
-        Some("LGPL-2.0")
-    } else if upper.contains("GNU GENERAL PUBLIC LICENSE") {
-        if upper.contains("VERSION 3") {
-            Some("GPL-3.0")
-        } else if upper.contains("VERSION 2") {
-            Some("GPL-2.0")
-        } else if upper.contains("VERSION 1") {
-            Some("GPL-1.0")
-        } else {
-            None
-        }
-    } else if upper.contains("MOZILLA PUBLIC LICENSE") {
-        Some("MPL-2.0")
+    } else if let Some(spdx) = gnu_or_mozilla_license(&upper) {
+        Some(spdx)
     } else if upper.contains("ISC LICENSE")
         || (upper.contains("ISC") && upper.contains("PERMISSION TO USE, COPY, MODIFY"))
     {
@@ -344,6 +313,75 @@ fn detect_license(content: &str) -> Option<&'static str> {
     } else {
         None
     }
+}
+
+/// Identify a GNU or Mozilla license from its uppercased text.
+///
+/// These licenses name each other in their own bodies: the GPL-3.0 has a
+/// section titled "Use with the GNU Affero General Public License" and closes
+/// by recommending the Lesser GPL, the GPL-2.0 closes the same way, and the
+/// MPL-2.0 lists the GPL, LGPL and AGPL as "Secondary Licenses". Testing for
+/// the mere presence of a title therefore misreads all three, so the license
+/// is the one whose title appears *first* - its heading, or the "under the
+/// terms of ..." line of a short notice.
+///
+/// The version is likewise read just after that title, where "Version 3, 29
+/// June 2007" or "either version 2 of the License" sits, and only taken from
+/// the text as a whole when the title is not followed by one. Markers are
+/// tried in order, so "VERSION 2.1" is listed before "VERSION 2".
+fn gnu_or_mozilla_license(upper: &str) -> Option<&'static str> {
+    type Family = (
+        &'static str,
+        &'static [(&'static str, &'static str)],
+        Option<&'static str>,
+    );
+    const FAMILIES: &[Family] = &[
+        (
+            "GNU AFFERO GENERAL PUBLIC LICENSE",
+            &[("VERSION 3", "AGPL-3.0")],
+            Some("AGPL-1.0"),
+        ),
+        (
+            "GNU LESSER GENERAL PUBLIC LICENSE",
+            &[("VERSION 3", "LGPL-3.0"), ("VERSION 2.1", "LGPL-2.1")],
+            Some("LGPL-2.0"),
+        ),
+        ("GNU LIBRARY GENERAL PUBLIC LICENSE", &[], Some("LGPL-2.0")),
+        (
+            "GNU GENERAL PUBLIC LICENSE",
+            &[
+                ("VERSION 3", "GPL-3.0"),
+                ("VERSION 2", "GPL-2.0"),
+                ("VERSION 1", "GPL-1.0"),
+            ],
+            None,
+        ),
+        ("MOZILLA PUBLIC LICENSE", &[], Some("MPL-2.0")),
+    ];
+    /// How far past the title its version is looked for, in bytes.
+    const VERSION_WINDOW: usize = 120;
+
+    let (start, (title, versions, unversioned)) = FAMILIES
+        .iter()
+        .filter_map(|family| upper.find(family.0).map(|start| (start, family)))
+        .min_by_key(|(start, _)| *start)?;
+
+    let after_title = &upper[start + title.len()..];
+    let mut window_end = after_title.len().min(VERSION_WINDOW);
+    while !after_title.is_char_boundary(window_end) {
+        window_end -= 1;
+    }
+    let near_title = &after_title[..window_end];
+
+    let version_in = |text: &str| {
+        versions
+            .iter()
+            .find(|(marker, _)| text.contains(marker))
+            .map(|(_, spdx)| *spdx)
+    };
+    version_in(near_title)
+        .or_else(|| version_in(upper))
+        .or(*unversioned)
 }
 
 /// Secret-scanning patterns, compiled once rather than per scanned file.
@@ -459,6 +497,44 @@ mod tests {
 
         let gpl2 = "GNU GENERAL PUBLIC LICENSE\nVersion 2, June 1991";
         assert_eq!(detect_license(gpl2), Some("GPL-2.0"));
+    }
+
+    /// The full license texts name other licenses in their bodies; each must
+    /// still be identified by its own title rather than the ones it mentions.
+    #[test]
+    fn licenses_naming_other_licenses_are_identified_by_their_title() {
+        let gpl3 = "GNU GENERAL PUBLIC LICENSE\n                       Version 3, 29 June 2007\n\n\
+            13. Use with the GNU Affero General Public License.\n\
+            Notwithstanding any other provision of this License, you have permission to \
+            link or combine any covered work with a work licensed under version 3 of the \
+            GNU Affero General Public License into a single combined work.\n\
+            If this is what you want to do, use the GNU Lesser General Public License \
+            instead of this License.";
+        assert_eq!(detect_license(gpl3), Some("GPL-3.0"));
+
+        let gpl2 = "GNU GENERAL PUBLIC LICENSE\n                       Version 2, June 1991\n\n\
+            If this is what you want to do, use the GNU Lesser General Public License \
+            instead of this License.";
+        assert_eq!(detect_license(gpl2), Some("GPL-2.0"));
+
+        let mpl2 = "Mozilla Public License Version 2.0\n==================================\n\
+            1.12. \"Secondary License\"\n    means either the GNU General Public License, \
+            Version 2.0, the GNU Lesser General Public License, Version 2.1, the GNU \
+            Affero General Public License, Version 3.0, or any later versions of those \
+            licenses.";
+        assert_eq!(detect_license(mpl2), Some("MPL-2.0"));
+    }
+
+    /// A short notice in place of the full text names its license in the
+    /// "under the terms of" line, with the version shortly after.
+    #[test]
+    fn gpl_notice_takes_the_version_after_the_title() {
+        let notice = "Copyright (C) 2024 Example\n\n\
+            This program is free software: you can redistribute it and/or modify it \
+            under the terms of the GNU General Public License as published by the Free \
+            Software Foundation, either version 2 of the License, or (at your option) \
+            any later version.\n\nSee the bundled LGPL version 3 notice for libfoo.";
+        assert_eq!(detect_license(notice), Some("GPL-2.0"));
     }
 
     #[test]
