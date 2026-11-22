@@ -70,27 +70,12 @@ struct LibrariesIoProject {
     language: Option<String>,
     status: Option<String>,
     dependents_count: Option<u32>,
-    #[allow(dead_code)]
-    dependent_repositories_count: Option<u32>,
     rank: Option<u32>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
-struct LibrariesIoVersion {
-    number: String,
-    #[serde(default, deserialize_with = "lenient_datetime")]
-    published_at: Option<DateTime<Utc>>,
-    spdx_expression: Option<String>,
-    original_license: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct LibrariesIoDependency {
-    project_name: String,
     name: String,
-    platform: String,
     requirements: String,
     /// Dependency kind: `runtime`, `development`, `test`, `optional`, ...
     ///
@@ -100,20 +85,11 @@ struct LibrariesIoDependency {
     kind: Option<String>,
     #[serde(default)]
     optional: Option<bool>,
-    latest_stable: Option<String>,
-    latest: Option<String>,
-    deprecated: Option<bool>,
-    outdated: Option<bool>,
 }
 
 #[derive(Debug, Deserialize)]
-#[allow(dead_code)]
 struct LibrariesIoPlatform {
     name: String,
-    project_count: u32,
-    homepage: Option<String>,
-    color: Option<String>,
-    default_language: Option<String>,
 }
 
 /// Decode a JSON response, treating a non-success status as an error.

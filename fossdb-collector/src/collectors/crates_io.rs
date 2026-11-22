@@ -55,18 +55,22 @@ impl CratesIoCollector {
         candidates
             .into_iter()
             .take(MAX_VERSIONS_PER_CRATE)
-            .map(|v| CollectedVersion {
-                version: v.num.clone(),
-                release_date: v.created_at,
-                download_url: Some(format!("https://crates.io{}", v.dl_path)),
-                // crates.io publishes the hex sha256 of the .crate file, so the
-                // worker can actually verify archive integrity.
-                checksum: Some(v.checksum.clone()),
-                dependencies: Vec::new(),
-                changelog: None,
-                yanked: Some(false),
-            })
+            .map(Self::to_collected_version)
             .collect()
+    }
+
+    fn to_collected_version(v: &crates_io_api::Version) -> CollectedVersion {
+        CollectedVersion {
+            version: v.num.clone(),
+            release_date: v.created_at,
+            download_url: Some(format!("https://crates.io{}", v.dl_path)),
+            // crates.io publishes the hex sha256 of the .crate file, so the
+            // worker can actually verify archive integrity.
+            checksum: Some(v.checksum.clone()),
+            dependencies: Vec::new(),
+            changelog: None,
+            yanked: Some(v.yanked),
+        }
     }
 
     /// Stored versions whose yank state on crates.io differs from what the
@@ -81,15 +85,7 @@ impl CratesIoCollector {
             .iter()
             .filter(|v| stored.contains(v.num.as_str()))
             .filter(|v| v.yanked != yanked.contains(v.num.as_str()))
-            .map(|v| CollectedVersion {
-                version: v.num.clone(),
-                release_date: v.created_at,
-                download_url: Some(format!("https://crates.io{}", v.dl_path)),
-                checksum: Some(v.checksum.clone()),
-                dependencies: Vec::new(),
-                changelog: None,
-                yanked: Some(v.yanked),
-            })
+            .map(Self::to_collected_version)
             .collect()
     }
 

@@ -2,14 +2,10 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use fossdb::url::percent_encode;
 use fossdb::{CollectedPackage, Package, PackageLookup};
-use reqwest::Client;
-use serde::Serialize;
+use reqwest::{Client, Method, Response};
+use serde::{Serialize, de::DeserializeOwned};
 use std::time::Duration;
 
-#[cfg(feature = "collector-libraries-io")]
-use reqwest::Response;
-#[cfg(feature = "collector-libraries-io")]
-use std::sync::Arc;
 #[cfg(feature = "collector-libraries-io")]
 use std::time::Instant;
 
@@ -97,51 +93,48 @@ impl CollectorClient {
         })
     }
 
-    fn auth_header(&self) -> String {
-        format!("Bearer {}", self.api_key)
-    }
-
-    pub async fn get_package(&self, name: &str) -> Result<Option<PackageLookup>> {
-        let resp = self
+    /// Send `request` to `path` with the collector's key and return the
+    /// response, or `None` for a 404. Any other non-success status is an
+    /// error, marked by [`server_error`] when it would repeat.
+    async fn send(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&impl Serialize>,
+    ) -> Result<Option<Response>> {
+        let mut request = self
             .client
-            .get(format!(
-                "{}/packages?name={}",
-                self.base_url,
-                percent_encode(name)
-            ))
-            .header("Authorization", self.auth_header())
-            .send()
-            .await
-            .map_err(server_error)?;
-
+            .request(method, format!("{}{path}", self.base_url))
+            .bearer_auth(&self.api_key);
+        if let Some(body) = body {
+            request = request.json(body);
+        }
+        let resp = request.send().await.map_err(server_error)?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Ok(None);
         }
+        Ok(Some(resp.error_for_status().map_err(server_error)?))
+    }
 
-        let lookup: PackageLookup = resp
-            .error_for_status()
-            .map_err(server_error)?
-            .json()
-            .await?;
-        Ok(Some(lookup))
+    /// [`Self::send`] a JSON `body` and decode the JSON answer, for endpoints
+    /// where a 404 is an error like any other.
+    async fn post<T: DeserializeOwned>(&self, path: &str, body: &impl Serialize) -> Result<T> {
+        match self.send(Method::POST, path, Some(body)).await? {
+            Some(resp) => Ok(resp.json().await?),
+            None => anyhow::bail!("fossdb-server has no {path} endpoint (404)"),
+        }
+    }
+
+    pub async fn get_package(&self, name: &str) -> Result<Option<PackageLookup>> {
+        let path = format!("/packages?name={}", percent_encode(name));
+        match self.send(Method::GET, &path, None::<&()>).await? {
+            Some(resp) => Ok(Some(resp.json().await?)),
+            None => Ok(None),
+        }
     }
 
     pub async fn submit_package(&self, pkg: CollectedPackage) -> Result<Package> {
-        let resp = self
-            .client
-            .post(format!("{}/packages", self.base_url))
-            .header("Authorization", self.auth_header())
-            .json(&pkg)
-            .send()
-            .await
-            .map_err(server_error)?;
-
-        let package: Package = resp
-            .error_for_status()
-            .map_err(server_error)?
-            .json()
-            .await?;
-        Ok(package)
+        self.post("/packages", &pkg).await
     }
 
     #[cfg(feature = "collector-osv")]
@@ -149,20 +142,7 @@ impl CollectorClient {
         &self,
         advisory: &fossdb::CollectedAdvisory,
     ) -> Result<fossdb::AdvisoryIngestResult> {
-        let resp = self
-            .client
-            .post(format!("{}/advisories", self.base_url))
-            .header("Authorization", self.auth_header())
-            .json(advisory)
-            .send()
-            .await
-            .map_err(server_error)?;
-
-        Ok(resp
-            .error_for_status()
-            .map_err(server_error)?
-            .json()
-            .await?)
+        self.post("/advisories", advisory).await
     }
 
     pub async fn update_package_timestamp(
@@ -170,25 +150,12 @@ impl CollectorClient {
         name: &str,
         updated_at: DateTime<Utc>,
     ) -> Result<()> {
-        #[derive(Serialize)]
-        struct Body {
-            updated_at: DateTime<Utc>,
+        let path = format!("/packages/{}/timestamp", percent_encode(name));
+        let body = serde_json::json!({ "updated_at": updated_at });
+        match self.send(Method::PUT, &path, Some(&body)).await? {
+            Some(_) => Ok(()),
+            None => anyhow::bail!("fossdb-server has no package {name} to update (404)"),
         }
-
-        self.client
-            .put(format!(
-                "{}/packages/{}/timestamp",
-                self.base_url,
-                percent_encode(name)
-            ))
-            .header("Authorization", self.auth_header())
-            .json(&Body { updated_at })
-            .send()
-            .await
-            .map_err(server_error)?
-            .error_for_status()
-            .map_err(server_error)?;
-        Ok(())
     }
 }
 
@@ -213,11 +180,10 @@ pub struct AdaptiveConfig {
 /// code used `Quota::per_second` with the same numbers, allowing ~60x the
 /// intended rate.
 #[cfg(feature = "collector-libraries-io")]
-#[derive(Clone)]
 pub struct AdaptiveRateLimitedClient {
     client: Client,
-    config: Arc<AdaptiveConfig>,
-    state: Arc<tokio::sync::Mutex<PacerState>>,
+    config: AdaptiveConfig,
+    state: tokio::sync::Mutex<PacerState>,
 }
 
 #[cfg(feature = "collector-libraries-io")]
@@ -234,11 +200,11 @@ impl AdaptiveRateLimitedClient {
         let initial = Self::clamp_rate(&config, config.initial_rate);
         Self {
             client,
-            state: Arc::new(tokio::sync::Mutex::new(PacerState {
+            state: tokio::sync::Mutex::new(PacerState {
                 rate_per_minute: initial,
                 next_allowed: Instant::now(),
-            })),
-            config: Arc::new(config),
+            }),
+            config,
         }
     }
 
