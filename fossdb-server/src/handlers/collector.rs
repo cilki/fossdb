@@ -65,8 +65,8 @@ pub async fn upsert_package(
         })
 }
 
-/// Insert a package, or add the versions of an already stored one that are
-/// new.
+/// Insert a package, or update an already stored one: add its new versions
+/// and refresh its metadata (see [`refresh_metadata`]).
 ///
 /// A package new to the database is checked against the popular names of
 /// its ecosystem; if it imitates one, that package's subscribers get a
@@ -79,13 +79,18 @@ pub fn store_package(
     db: &Database,
     broadcaster: &TimelineBroadcaster,
     lookalikes: &LookalikeTargets,
-    collected: CollectedPackage,
+    mut collected: CollectedPackage,
 ) -> anyhow::Result<fossdb::Package> {
     let now = Utc::now();
+    let mut versions = std::mem::take(&mut collected.versions);
 
     let existing = db.get_package_by_name(&collected.name)?;
 
-    let (package, known_versions) = match existing {
+    // For a stored package: the row as read, to tell whether it needs writing
+    // back once its metadata is refreshed and its new versions are in.
+    let mut stored_row = None;
+
+    let (mut package, known_versions) = match existing {
         Some(existing) => {
             let known: HashMap<String, PackageVersion> = db
                 .get_versions_by_package(existing.id)
@@ -93,7 +98,10 @@ pub fn store_package(
                 .into_iter()
                 .map(|v| (v.version.clone(), v))
                 .collect();
-            (existing, known)
+            let mut package = existing.clone();
+            refresh_metadata(&mut package.inner, collected);
+            stored_row = Some(existing);
+            (package, known)
         }
         None => {
             let package = Package {
@@ -134,11 +142,11 @@ pub fn store_package(
     // batch as sent made the worker analyse the *oldest* collected release of
     // every new crate and never the current one. The sort is stable, so
     // versions sharing a date keep the order they were sent in.
-    let mut versions = collected.versions;
     versions.sort_by_key(|v| v.release_date);
 
     // Each insert is announced by the PackageVersion watch in db_listener.
     let mut newly_yanked = Vec::new();
+    let mut inserted_any = false;
     for v in versions {
         if let Some(stored) = known_versions.get(&v.version) {
             let Some(yanked) = v.yanked else { continue };
@@ -174,8 +182,20 @@ pub fn store_package(
                 yanked_at: None,
             },
         };
-        if let Err(e) = db.insert_version(version) {
-            tracing::error!("Failed to insert version: {}", e);
+        match db.insert_version(version) {
+            Ok(_) => inserted_any = true,
+            Err(e) => tracing::error!("Failed to insert version: {}", e),
+        }
+    }
+
+    if let Some(stored_row) = stored_row {
+        // A new release is an update, whichever collector found it. Only
+        // crates.io sends a timestamp of its own, after this returns.
+        if inserted_any {
+            package.updated_at = now;
+        }
+        if package.inner != stored_row.inner {
+            db.update(package.clone())?;
         }
     }
 
@@ -184,6 +204,32 @@ pub fn store_package(
     }
 
     Ok(package.inner)
+}
+
+/// Overwrite a stored package's metadata with what a collector reports now,
+/// so that relicensing, a new homepage or a growing dependents count reach
+/// the database instead of staying as they were on first ingest.
+///
+/// A field the collector leaves empty (`None`, or no tags) keeps its stored
+/// value: the crates.io collector sends nothing but versions for a package it
+/// already has. The name and platform identify the package and never change.
+fn refresh_metadata(stored: &mut fossdb::Package, collected: CollectedPackage) {
+    fn refresh<T>(stored: &mut Option<T>, collected: Option<T>) {
+        if collected.is_some() {
+            *stored = collected;
+        }
+    }
+    refresh(&mut stored.description, collected.description);
+    refresh(&mut stored.homepage, collected.homepage);
+    refresh(&mut stored.repository, collected.repository);
+    refresh(&mut stored.license, collected.license);
+    refresh(&mut stored.language, collected.language);
+    refresh(&mut stored.status, collected.status);
+    refresh(&mut stored.dependents_count, collected.dependents_count);
+    refresh(&mut stored.rank, collected.rank);
+    if !collected.tags.is_empty() {
+        stored.tags = collected.tags;
+    }
 }
 
 pub async fn upsert_advisory(
@@ -767,6 +813,58 @@ mod tests {
             order(&db, package.id),
             ["1.0.0", "1.1.0", "1.2.0", "1.3.0", "1.4.0"]
         );
+    }
+
+    /// A collector that re-sends a stored package (libraries.io does, every
+    /// run) refreshes its metadata; one that sends only versions (crates.io)
+    /// leaves the metadata alone.
+    #[test]
+    fn resubmitting_a_package_refreshes_its_metadata() {
+        let (_dir, db) = open_db();
+        let store = |p| {
+            store_package(&db, &TimelineBroadcaster::new(), &LookalikeTargets::new(), p).unwrap()
+        };
+        let mut first = collected("left-pad", "NPM", Some(10), &[]);
+        first.description = Some("pads strings".into());
+        first.license = Some("WTFPL".into());
+        first.tags = vec!["npm".into()];
+        let package = store(first);
+
+        let mut again = collected("left-pad", "NPM", Some(5000), &[]);
+        again.versions.clear();
+        again.description = Some("String left pad".into());
+        again.homepage = Some("https://example.com".into());
+        again.license = Some("MIT".into());
+        again.tags = vec!["npm".into(), "libraries.io".into()];
+        again.rank = Some(20);
+        let returned = store(again);
+
+        let stored = db.get_package(package.id).unwrap().unwrap().inner;
+        assert_eq!(returned, stored);
+        assert_eq!(stored.description.as_deref(), Some("String left pad"));
+        assert_eq!(stored.homepage.as_deref(), Some("https://example.com"));
+        assert_eq!(stored.license.as_deref(), Some("MIT"));
+        assert_eq!(stored.dependents_count, Some(5000));
+        assert_eq!(stored.rank, Some(20));
+        assert_eq!(stored.tags, ["npm", "libraries.io"]);
+        // No new release, so not an update.
+        assert_eq!(stored.updated_at, package.updated_at);
+        assert_eq!(stored.created_at, package.created_at);
+
+        // Versions only, as crates.io sends for a package it already has.
+        let mut versions_only = collected("left-pad", "NPM", None, &[]);
+        versions_only.platform = None;
+        versions_only.versions[0].version = "1.1.0".into();
+        let returned = store(versions_only);
+
+        let stored = db.get_package(package.id).unwrap().unwrap().inner;
+        assert_eq!(returned, stored);
+        assert_eq!(stored.license.as_deref(), Some("MIT"));
+        assert_eq!(stored.dependents_count, Some(5000));
+        assert_eq!(stored.tags, ["npm", "libraries.io"]);
+        assert_eq!(stored.platform.as_deref(), Some("NPM"));
+        // A new release moves the package into "updated recently".
+        assert!(stored.updated_at > package.updated_at);
     }
 
     /// `serde` as crates.io would send it: each version with its yank state.
