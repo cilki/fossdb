@@ -1,11 +1,12 @@
 use crate::AppState;
 use axum::{extract::State, http::StatusCode, response::Json};
 use serde::Serialize;
+use std::collections::{BTreeSet, HashMap};
 
 // `DatabaseStats` comes from the shared `fossdb` crate. A local copy used to
 // shadow it here, which is the same class of drift that previously broke
 // `SubscriptionResponse`.
-use crate::DatabaseStats;
+use crate::{DatabaseStats, Package, Vulnerability, VulnerabilitySeverity};
 
 #[derive(Serialize)]
 pub struct AnalyticsResponse {
@@ -56,10 +57,72 @@ pub struct GrowthPoint {
     pub cumulative_total: u64,
 }
 
+/// Count `values` and return `(value, count, percentage of total)`, most
+/// common first.
+fn distribution<'a>(values: impl Iterator<Item = &'a str>, total: u64) -> Vec<(String, u64, f32)> {
+    let mut counts: HashMap<&str, u64> = HashMap::new();
+    for value in values {
+        *counts.entry(value).or_default() += 1;
+    }
+    let mut dist: Vec<_> = counts
+        .into_iter()
+        .map(|(value, count)| {
+            let percentage = if total > 0 {
+                (count as f32 / total as f32) * 100.0
+            } else {
+                0.0
+            };
+            (value.to_string(), count, percentage)
+        })
+        .collect();
+    dist.sort_by(|a, b| b.1.cmp(&a.1));
+    dist
+}
+
+fn language_stats(packages: &[Package]) -> Vec<LanguageStats> {
+    let languages = packages.iter().filter_map(|p| p.language.as_deref());
+    distribution(languages, packages.len() as u64)
+        .into_iter()
+        .map(|(language, count, percentage)| LanguageStats {
+            language,
+            percentage,
+            count,
+        })
+        .collect()
+}
+
+fn license_stats(packages: &[Package]) -> Vec<LicenseStats> {
+    let licenses = packages.iter().filter_map(|p| p.license.as_deref());
+    distribution(licenses, packages.len() as u64)
+        .into_iter()
+        .map(|(license, count, percentage)| LicenseStats {
+            license,
+            percentage,
+            count,
+        })
+        .collect()
+}
+
+fn security_stats(total_packages: u64, vulnerabilities: &[Vulnerability]) -> SecurityStats {
+    let count = |pred: fn(&VulnerabilitySeverity) -> bool| {
+        vulnerabilities.iter().filter(|v| pred(&v.severity)).count() as u64
+    };
+    SecurityStats {
+        clean_packages: total_packages.saturating_sub(vulnerabilities.len() as u64),
+        minor_issues: count(|s| {
+            matches!(
+                s,
+                VulnerabilitySeverity::Low | VulnerabilitySeverity::Medium
+            )
+        }),
+        critical_vulnerabilities: count(|s| matches!(s, VulnerabilitySeverity::Critical)),
+        scan_coverage: if total_packages > 0 { 100.0 } else { 0.0 },
+    }
+}
+
 pub async fn get_analytics(
     State(state): State<AppState>,
 ) -> Result<Json<AnalyticsResponse>, StatusCode> {
-    // Fetch real data from database
     let packages = state
         .db
         .get_all_packages()
@@ -70,71 +133,7 @@ pub async fn get_analytics(
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
 
     let total = packages.len() as u64;
-
-    // Calculate language distribution from actual packages
-    let mut language_counts = std::collections::HashMap::new();
-    let mut license_counts = std::collections::HashMap::new();
-
-    for pkg in &packages {
-        if let Some(lang) = &pkg.language {
-            *language_counts.entry(lang.clone()).or_insert(0) += 1;
-        }
-        if let Some(license) = &pkg.license {
-            *license_counts.entry(license.clone()).or_insert(0) += 1;
-        }
-    }
-
-    // Build language distribution
-    let mut language_distribution: Vec<LanguageStats> = language_counts
-        .into_iter()
-        .map(|(lang, count)| LanguageStats {
-            language: lang,
-            percentage: if total > 0 {
-                (count as f32 / total as f32) * 100.0
-            } else {
-                0.0
-            },
-            count,
-        })
-        .collect();
-    language_distribution.sort_by(|a, b| b.count.cmp(&a.count));
-
-    // Build license distribution
-    let mut license_distribution: Vec<LicenseStats> = license_counts
-        .into_iter()
-        .map(|(license, count)| LicenseStats {
-            license,
-            percentage: if total > 0 {
-                (count as f32 / total as f32) * 100.0
-            } else {
-                0.0
-            },
-            count,
-        })
-        .collect();
-    license_distribution.sort_by(|a, b| b.count.cmp(&a.count));
-
-    // Calculate security stats from real vulnerabilities
-    let critical_vulns = vulnerabilities
-        .iter()
-        .filter(|v| matches!(v.severity, crate::VulnerabilitySeverity::Critical))
-        .count() as u64;
-    let minor_issues = vulnerabilities
-        .iter()
-        .filter(|v| {
-            matches!(
-                v.severity,
-                crate::VulnerabilitySeverity::Low | crate::VulnerabilitySeverity::Medium
-            )
-        })
-        .count() as u64;
-
-    let security_overview = SecurityStats {
-        clean_packages: total.saturating_sub(vulnerabilities.len() as u64),
-        minor_issues,
-        critical_vulnerabilities: critical_vulns,
-        scan_coverage: if total > 0 { 100.0 } else { 0.0 },
-    };
+    let language_distribution = language_stats(&packages);
 
     // Trending packages - just get most recent packages for now
     let trending_packages: Vec<TrendingPackage> = packages
@@ -145,25 +144,20 @@ pub async fn get_analytics(
             name: pkg.name.clone(),
             description: pkg.description.clone().unwrap_or_default(),
             growth_percentage: 0.0, // No historical data yet
-            category: pkg
-                .platform
-                .clone()
-                .unwrap_or_else(|| "other".to_string()),
+            category: pkg.platform.clone().unwrap_or_else(|| "other".to_string()),
         })
         .collect();
 
-    let analytics = AnalyticsResponse {
+    Ok(Json(AnalyticsResponse {
         total_packages: total,
         programming_languages: language_distribution.len() as u64,
         weekly_updates: 0, // Would need historical tracking
         language_distribution,
-        license_distribution,
+        license_distribution: license_stats(&packages),
         trending_packages,
-        security_overview,
+        security_overview: security_stats(total, &vulnerabilities),
         growth_data: vec![], // Would need historical tracking
-    };
-
-    Ok(Json(analytics))
+    }))
 }
 
 pub async fn get_language_trends(
@@ -173,31 +167,7 @@ pub async fn get_language_trends(
         .db
         .get_all_packages()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let total = packages.len() as u64;
-    let mut language_counts = std::collections::HashMap::new();
-
-    for pkg in &packages {
-        if let Some(lang) = &pkg.language {
-            *language_counts.entry(lang.clone()).or_insert(0) += 1;
-        }
-    }
-
-    let mut trends: Vec<LanguageStats> = language_counts
-        .into_iter()
-        .map(|(lang, count)| LanguageStats {
-            language: lang,
-            percentage: if total > 0 {
-                (count as f32 / total as f32) * 100.0
-            } else {
-                0.0
-            },
-            count,
-        })
-        .collect();
-    trends.sort_by(|a, b| b.count.cmp(&a.count));
-
-    Ok(Json(trends))
+    Ok(Json(language_stats(&packages)))
 }
 
 pub async fn get_security_report(
@@ -211,30 +181,10 @@ pub async fn get_security_report(
         .db
         .get_all_vulnerabilities()
         .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
-
-    let total = packages.len() as u64;
-    let critical_vulns = vulnerabilities
-        .iter()
-        .filter(|v| matches!(v.severity, crate::VulnerabilitySeverity::Critical))
-        .count() as u64;
-    let minor_issues = vulnerabilities
-        .iter()
-        .filter(|v| {
-            matches!(
-                v.severity,
-                crate::VulnerabilitySeverity::Low | crate::VulnerabilitySeverity::Medium
-            )
-        })
-        .count() as u64;
-
-    let security_stats = SecurityStats {
-        clean_packages: total.saturating_sub(vulnerabilities.len() as u64),
-        minor_issues,
-        critical_vulnerabilities: critical_vulns,
-        scan_coverage: if total > 0 { 100.0 } else { 0.0 },
-    };
-
-    Ok(Json(security_stats))
+    Ok(Json(security_stats(
+        packages.len() as u64,
+        &vulnerabilities,
+    )))
 }
 
 pub async fn get_db_stats(
@@ -272,16 +222,12 @@ pub async fn get_db_stats(
         // enumerate running collector processes - they are anonymous HTTP
         // clients sharing one API key - so this reports evidence of
         // collection, not liveness.
-        collectors_running: {
-            let mut platforms: Vec<String> = packages
-                .iter()
-                .filter_map(|p| p.platform.clone())
-                .collect::<std::collections::BTreeSet<_>>()
-                .into_iter()
-                .collect();
-            platforms.sort();
-            platforms
-        },
+        collectors_running: packages
+            .iter()
+            .filter_map(|p| p.platform.clone())
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect(),
     };
 
     Ok(Json(stats))
