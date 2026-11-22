@@ -5,7 +5,7 @@ use axum::{
 };
 use fossdb::{WorkerAnalysis as FossdbWorkerAnalysis, WorkerTask};
 
-use crate::db_listener::emit_install_hook_changes;
+use crate::db_listener::emit_analysis_alerts;
 use crate::{AppState, PackageVersion, WorkerAnalysis};
 
 /// The version of a package the worker should analyse: the latest live one
@@ -129,9 +129,9 @@ pub async fn submit_analysis(
 
     // The analysis is stored; failing to notify must not fail the submission,
     // or the worker would redo the whole analysis.
-    if let Err(e) = emit_install_hook_changes(&state.db, &state.broadcaster, &saved.inner) {
+    if let Err(e) = emit_analysis_alerts(&state.db, &state.broadcaster, &saved.inner) {
         tracing::error!(
-            "Failed to compare install hooks for analysis {}: {}",
+            "Failed to raise alerts for analysis {}: {}",
             saved.id,
             e
         );

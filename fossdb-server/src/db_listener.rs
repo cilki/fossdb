@@ -445,6 +445,231 @@ pub fn emit_install_hook_changes(
     Ok(())
 }
 
+/// Raise every alert a newly stored analysis calls for: install hook changes
+/// (see [`emit_install_hook_changes`]) and the other notable findings (see
+/// [`emit_finding_alerts`]). One failing does not stop the other.
+pub fn emit_analysis_alerts(
+    db: &Database,
+    broadcaster: &TimelineBroadcaster,
+    analysis: &fossdb::WorkerAnalysis,
+) -> Result<()> {
+    let hooks = emit_install_hook_changes(db, broadcaster, analysis);
+    let findings = emit_finding_alerts(db, broadcaster, analysis);
+    hooks.and(findings)
+}
+
+/// Whether a finding that is new since the baseline is worth telling
+/// subscribers about, and if so how loudly. `ChecksumMismatch` and
+/// `InstallHook` have their own rules and are not covered here.
+///
+/// Only Critical secrets alert: they are private keys and cloud credentials,
+/// which let whoever finds them act as the maintainer. The High and Medium
+/// patterns (credentials in URLs, hardcoded passwords) mostly match
+/// placeholders in docs and tests. Binary findings count from Medium up; the
+/// Low ones are symbol-name matches that most native code trips.
+fn new_finding_event(finding: &fossdb::AnalysisFinding) -> Option<EventType> {
+    use fossdb::{FindingKind, FindingSeverity};
+    match (&finding.kind, &finding.severity) {
+        (FindingKind::SecretDetected, FindingSeverity::Critical) => Some(EventType::SecurityAlert),
+        (
+            FindingKind::MaliciousPattern | FindingKind::SyscallReachable,
+            FindingSeverity::Medium | FindingSeverity::High | FindingSeverity::Critical,
+        ) => Some(EventType::BehaviorChange),
+        _ => None,
+    }
+}
+
+/// What identifies `finding` across versions of a package, so that the same
+/// finding in the baseline does not alert again.
+///
+/// Source archives usually unpack into a versioned top-level directory
+/// (`serde-1.0.200/src/lib.rs`), so a leading path component naming `version`
+/// is dropped from the location. The description loses the parts that change
+/// with every build: the address of a reachable syscall and the measured
+/// entropy of a packed section.
+fn finding_identity(
+    finding: &fossdb::AnalysisFinding,
+    version: &str,
+) -> (String, Option<String>, String) {
+    let location = finding.location.as_deref().map(|location| {
+        match location.split_once('/') {
+            Some((top, rest)) if !version.is_empty() && top.contains(version) => rest,
+            _ => location,
+        }
+        .to_owned()
+    });
+    let description = [" at 0x", " (entropy="]
+        .iter()
+        .fold(finding.description.as_str(), |d, marker| {
+            d.split_once(marker).map_or(d, |(stable, _)| stable)
+        })
+        .to_owned();
+    (format!("{:?}", finding.kind), location, description)
+}
+
+/// The findings of `current` (analysis of `version`) that warrant an alert
+/// because `baseline` (analysis of `baseline_version`) did not have them, with
+/// the event each calls for, in `current`'s order. With no baseline nothing is
+/// new: a package's first analysis would otherwise alert on everything it has
+/// always shipped.
+pub fn new_notable_findings<'a>(
+    baseline: Option<(&[fossdb::AnalysisFinding], &str)>,
+    current: &'a [fossdb::AnalysisFinding],
+    version: &str,
+) -> Vec<(&'a fossdb::AnalysisFinding, EventType)> {
+    let Some((baseline, baseline_version)) = baseline else {
+        return Vec::new();
+    };
+    let before: std::collections::HashSet<_> = baseline
+        .iter()
+        .map(|f| finding_identity(f, baseline_version))
+        .collect();
+    current
+        .iter()
+        .filter_map(|f| new_finding_event(f).map(|event| (f, event)))
+        .filter(|(f, _)| !before.contains(&finding_identity(f, version)))
+        .collect()
+}
+
+/// Tell the subscribers of a package when a newly stored analysis found
+/// something they should know about, in one event per analysis:
+///
+/// - a `ChecksumMismatch`, always, even on the package's first analysis: the
+///   archive the registry served is not the one that was published, which
+///   does not depend on history. A [`EventType::SecurityAlert`].
+/// - a Critical `SecretDetected` the baseline did not have: a
+///   [`EventType::SecurityAlert`].
+/// - a Medium or worse `MaliciousPattern` or `SyscallReachable` the baseline
+///   did not have: a [`EventType::BehaviorChange`], unless one of the above
+///   makes the event a security alert.
+///
+/// The baseline is the one [`emit_install_hook_changes`] uses.
+pub fn emit_finding_alerts(
+    db: &Database,
+    broadcaster: &TimelineBroadcaster,
+    analysis: &fossdb::WorkerAnalysis,
+) -> Result<()> {
+    let mismatch = analysis
+        .findings
+        .iter()
+        .find(|f| f.kind == fossdb::FindingKind::ChecksumMismatch);
+
+    let analysed = db.get_analyses_by_package(analysis.package_id)?;
+    let baseline = baseline_analysis(analysed, analysis.version_id);
+    let version = version_name(db, analysis.version_id)?;
+    let baseline_version = baseline
+        .as_ref()
+        .map(|b| version_name(db, b.version_id))
+        .transpose()?;
+
+    let new = new_notable_findings(
+        baseline
+            .as_ref()
+            .zip(baseline_version.as_deref())
+            .map(|(b, v)| (b.findings.as_slice(), v)),
+        &analysis.findings,
+        &version,
+    );
+    if mismatch.is_none() && new.is_empty() {
+        return Ok(());
+    }
+
+    let Some(package) = db.get_package(analysis.package_id)? else {
+        return Ok(());
+    };
+
+    let event_type = if mismatch.is_some()
+        || new.iter().any(|(_, e)| *e == EventType::SecurityAlert)
+    {
+        EventType::SecurityAlert
+    } else {
+        EventType::BehaviorChange
+    };
+
+    tracing::info!(
+        "{} {}: checksum mismatch: {}, {} new notable finding(s)",
+        package.name,
+        version,
+        mismatch.is_some(),
+        new.len()
+    );
+    let finding_json = |f: &fossdb::AnalysisFinding| {
+        serde_json::json!({
+            "kind": f.kind,
+            "severity": f.severity,
+            "description": f.description,
+            "location": f.location,
+        })
+    };
+    let metadata = serde_json::json!({
+        "analysis_id": analysis.id,
+        "baseline_analysis_id": baseline.as_ref().map(|b| b.id),
+        "baseline_version": baseline_version,
+        "checksum_mismatch": mismatch.map(finding_json),
+        "findings": new.iter().map(|(f, _)| finding_json(f)).collect::<Vec<_>>(),
+    });
+    let new_findings: Vec<_> = new.iter().map(|(f, _)| *f).collect();
+    notify_subscribers(
+        db,
+        broadcaster,
+        fossdb::TimelineEvent {
+            id: 0,
+            package_id: package.id,
+            user_id: None,
+            event_type,
+            message: finding_alert_message(
+                &version,
+                package.platform.as_deref(),
+                mismatch,
+                baseline_version.as_deref(),
+                &new_findings,
+            ),
+            package_name: package.inner.name,
+            version: Some(version),
+            metadata: Some(metadata.to_string()),
+            created_at: Utc::now(),
+        },
+    );
+    Ok(())
+}
+
+/// E.g. `1.4.3: the downloaded archive does not match the checksum crates.io
+/// published (Expected checksum 3f…, got 9a…). New since 1.4.2: AWS access
+/// key in src/config.rs.`
+fn finding_alert_message(
+    version: &str,
+    platform: Option<&str>,
+    mismatch: Option<&fossdb::AnalysisFinding>,
+    baseline: Option<&str>,
+    new: &[&fossdb::AnalysisFinding],
+) -> String {
+    let mut message = format!("{version}:");
+    if let Some(mismatch) = mismatch {
+        let publisher = platform.map(|p| format!("{p} ")).unwrap_or_default();
+        message.push_str(&format!(
+            " the downloaded archive does not match the checksum {publisher}published ({}).",
+            mismatch.description.trim_end_matches('.')
+        ));
+    }
+    if let (Some(baseline), false) = (baseline, new.is_empty()) {
+        let findings = new
+            .iter()
+            .map(|f| {
+                let description = f.description.trim_end_matches('.');
+                match (&f.kind, &f.location) {
+                    (fossdb::FindingKind::SecretDetected, Some(location)) => {
+                        format!("{description} in {location}")
+                    }
+                    _ => description.to_owned(),
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        message.push_str(&format!(" New since {baseline}: {findings}."));
+    }
+    message
+}
+
 /// E.g. `1.3.1 runs new install-time code compared with 1.3.0: added npm
 /// postinstall: node setup.js.`
 fn install_hook_message(version: &str, baseline: &str, changes: &[HookChange]) -> String {
@@ -669,7 +894,7 @@ mod tests {
                     },
                 })
                 .unwrap();
-            emit_install_hook_changes(&self.db, &TimelineBroadcaster::new(), &saved.inner)
+            emit_analysis_alerts(&self.db, &TimelineBroadcaster::new(), &saved.inner)
                 .unwrap();
         }
 
@@ -819,5 +1044,168 @@ mod tests {
         assert_eq!(hooks.version, "1.1.0");
         assert_eq!(hooks.baseline_version, None);
         assert_eq!(hooks.hooks[0].change, None);
+    }
+
+    fn finding(
+        kind: FindingKind,
+        severity: FindingSeverity,
+        description: &str,
+        location: &str,
+    ) -> AnalysisFinding {
+        AnalysisFinding {
+            kind,
+            severity,
+            description: description.into(),
+            location: Some(location.into()),
+        }
+    }
+
+    fn mismatch() -> AnalysisFinding {
+        finding(
+            FindingKind::ChecksumMismatch,
+            FindingSeverity::High,
+            "Expected checksum 3f00, got 9a11",
+            "https://example.invalid/left-pad-1.0.0.tgz",
+        )
+    }
+
+    fn aws_key(version: &str) -> AnalysisFinding {
+        finding(
+            FindingKind::SecretDetected,
+            FindingSeverity::Critical,
+            "AWS access key",
+            &format!("left-pad-{version}/src/config.js"),
+        )
+    }
+
+    fn execve(address: u64) -> AnalysisFinding {
+        finding(
+            FindingKind::SyscallReachable,
+            FindingSeverity::Medium,
+            &format!("Reachable syscall execve (#59) at 0x{address:x} args=[0x0, 0x0, 0x0, 0x0, 0x0, 0x0]"),
+            "left-pad",
+        )
+    }
+
+    #[test]
+    fn checksum_mismatch_alerts_even_on_the_first_analysis() {
+        let f = fixture();
+
+        f.analyse(0, vec![mismatch(), aws_key("1.0.0")]);
+
+        let events = f.events();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let event = &events[0];
+        assert_eq!(event.event_type, EventType::SecurityAlert);
+        assert_eq!(event.version.as_deref(), Some("1.0.0"));
+        assert_eq!(
+            event.message,
+            "1.0.0: the downloaded archive does not match the checksum NPM published \
+             (Expected checksum 3f00, got 9a11).",
+            "no baseline, so the secret is not new"
+        );
+        let metadata: serde_json::Value =
+            serde_json::from_str(event.metadata.as_deref().unwrap()).unwrap();
+        assert_eq!(metadata["checksum_mismatch"]["kind"], "ChecksumMismatch");
+        assert_eq!(metadata["baseline_version"], serde_json::Value::Null);
+        assert_eq!(metadata["findings"], serde_json::json!([]));
+    }
+
+    /// The same secret and syscall in a new version's versioned directory, at
+    /// a new address, are not new findings.
+    #[test]
+    fn findings_already_in_the_baseline_raise_nothing() {
+        let f = fixture();
+        f.analyse(0, vec![aws_key("1.0.0"), execve(0x401000)]);
+
+        f.analyse(1, vec![aws_key("1.1.0"), execve(0x402a10)]);
+
+        assert!(f.events().is_empty(), "{:?}", f.events());
+    }
+
+    #[test]
+    fn new_binary_behaviour_is_a_behavior_change() {
+        let f = fixture();
+        f.analyse(0, Vec::new());
+
+        f.analyse(1, vec![execve(0x401000)]);
+
+        let events = f.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, EventType::BehaviorChange);
+        assert_eq!(
+            events[0].message,
+            "1.1.0: New since 1.0.0: Reachable syscall execve (#59) at 0x401000 \
+             args=[0x0, 0x0, 0x0, 0x0, 0x0, 0x0]."
+        );
+        let metadata: serde_json::Value =
+            serde_json::from_str(events[0].metadata.as_deref().unwrap()).unwrap();
+        assert_eq!(metadata["baseline_version"], "1.0.0");
+        assert_eq!(metadata["checksum_mismatch"], serde_json::Value::Null);
+        assert_eq!(metadata["findings"][0]["kind"], "SyscallReachable");
+    }
+
+    /// A new Critical secret makes the whole event a security alert, and the
+    /// message lists every new finding.
+    #[test]
+    fn new_critical_secret_is_a_security_alert() {
+        let f = fixture();
+        f.analyse(0, Vec::new());
+
+        f.analyse(1, vec![execve(0x401000), aws_key("1.1.0")]);
+
+        let events = f.events();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, EventType::SecurityAlert);
+        assert!(
+            events[0]
+                .message
+                .ends_with("; AWS access key in left-pad-1.1.0/src/config.js."),
+            "{}",
+            events[0].message
+        );
+    }
+
+    #[test]
+    fn minor_findings_raise_nothing() {
+        let f = fixture();
+        f.analyse(0, Vec::new());
+
+        f.analyse(
+            1,
+            vec![
+                finding(FindingKind::SecretDetected, FindingSeverity::High, "Credentials in URL", "README.md"),
+                finding(FindingKind::SecretDetected, FindingSeverity::Medium, "Hardcoded password", "test.py"),
+                finding(FindingKind::MaliciousPattern, FindingSeverity::Low, "Potentially sensitive symbols: popen", "left-pad"),
+                finding(FindingKind::SyscallReachable, FindingSeverity::Info, "Reachable syscalls (1): read(0)", "left-pad"),
+                finding(FindingKind::LicenseDetected, FindingSeverity::Info, "License file detected: MIT", "LICENSE"),
+            ],
+        );
+
+        assert!(f.events().is_empty(), "{:?}", f.events());
+    }
+
+    #[test]
+    fn finding_identity_ignores_build_specific_details() {
+        let entropy = |section: &str, e: &str| {
+            finding(
+                FindingKind::MaliciousPattern,
+                FindingSeverity::Medium,
+                &format!("High-entropy section '{section}' (entropy={e}), possible packing or encryption"),
+                "left-pad",
+            )
+        };
+        assert_eq!(
+            finding_identity(&entropy(".data", "7.61"), "1.0.0"),
+            finding_identity(&entropy(".data", "7.93"), "1.1.0"),
+        );
+        assert_ne!(
+            finding_identity(&entropy(".data", "7.61"), "1.0.0"),
+            finding_identity(&entropy(".rodata", "7.61"), "1.0.0"),
+        );
+        // npm tarballs unpack into an unversioned `package/`, which is kept.
+        let npm = finding(FindingKind::SecretDetected, FindingSeverity::Critical, "AWS access key", "package/a.js");
+        assert_eq!(finding_identity(&npm, "1.0.0").1.as_deref(), Some("package/a.js"));
+        assert_eq!(finding_identity(&aws_key("1.0.0"), "1.0.0").1.as_deref(), Some("src/config.js"));
     }
 }
